@@ -1,0 +1,256 @@
+---
+title: "Analyze pA-DamID - correlations"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+In this document I will try to look into the NUP153 data track, and compare this
+to other tracks.
+
+
+### Method
+
+```{r supporting functions}
+# Read DamID normalized values
+ReadDamID <- function(dir, fnames, 
+                      seqlevels = c(paste0("chr", 1:22), "chrX"),
+                      chrom_sizes) {
+  # Read in the normalized .txt file
+  # The 4th column is the score:
+  
+  # Process first file and create GRanges object
+  damid <- read.table(file.path(dir,
+                      fnames[1]),
+                      stringsAsFactors = FALSE)
+  names(damid) <- c("seqnames", "start", "end", 
+                    gsub("-\\d+kb.*", "", fnames[1]))
+  
+  damid <- as(damid, "GRanges")
+  
+  # Add the other files as columns
+  if (length(fnames) > 1) {
+    for (f in fnames[2:length(fnames)]) {
+      score <- read.table(file.path(dir,
+                                    f),
+                          stringsAsFactors = FALSE)[, 4]
+      mcols(damid)[gsub("-\\d+kb.*", "", f)] <- score
+    }
+  }
+  
+  # Set seqlevels if given
+  if (! is.null(seqlevels)) {
+    seqlevels(damid, pruning = "coarse") <- seqlevels
+  }
+  
+  # Set seqlengths
+  seqlengths(damid) <- chrom_sizes[seqlevels(damid), "length"]
+  
+  damid
+}
+
+PlotVennFromGRanges <- function(hmm, GR_names, file_name) {
+
+  # Get the names
+  gr.list <- lapply(GR_names, function(x) {
+    gr <- hmm
+    mcols(gr) <- NULL
+    gr <- gr[which(mcols(hmm)[, x] == "AD")]
+  })
+  names.plot <- GR_names
+  
+  # Prepare the figures, depending on the number of input
+  if (length(names.plot) == 2) {
+
+    x <- gr.list[[1]]
+    y <- gr.list[[2]]
+
+    ab <- sum(width(intersect(x, y))) / 1e6
+    a <- sum(width(x)) / 1e6 - ab
+    b <- sum(width(y)) / 1e6 - ab
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab)
+
+  } else if (length(names.plot) == 3) {
+
+    x <- gr.list[[1]]
+    y <- gr.list[[2]]
+    z <- gr.list[[3]]
+
+    abc <- sum(width(intersect(intersect(x, y), z)) / 1e6)
+    ab <- sum(width(intersect(x, y)) / 1e6) - abc
+    bc <- sum(width(intersect(y, z)) / 1e6) - abc
+    ac <- sum(width(intersect(x, z)) / 1e6) - abc
+    a <- sum(width(x) / 1e6) - abc - ab - ac
+    b <- sum(width(y) / 1e6) - abc - ab - bc
+    c <- sum(width(z) / 1e6) - abc - ac - bc
+
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc)
+
+  } else if (length(names.plot) == 4) {
+
+    x <- gr.list[[1]]
+    y <- gr.list[[2]]
+    z <- gr.list[[3]]
+    q <- gr.list[[4]]
+    
+    abcd <- sum(width(intersect(intersect(intersect(x, y), z), q)) / 1e6)
+    
+    abc <- sum(width(intersect(intersect(x, y), z)) / 1e6) - abcd
+    abd <- sum(width(intersect(intersect(x, y), q)) / 1e6) - abcd
+    acd <- sum(width(intersect(intersect(x, z), q)) / 1e6) - abcd
+    bcd <- sum(width(intersect(intersect(y, z), q)) / 1e6) - abcd
+    
+    ab <- sum(width(intersect(x, y)) / 1e6) - abc - abd - abcd
+    ac <- sum(width(intersect(x, z)) / 1e6) - abc - acd - abcd
+    ad <- sum(width(intersect(x, q)) / 1e6) - abd - acd - abcd
+    bc <- sum(width(intersect(y, z)) / 1e6) - abc - bcd - abcd
+    bd <- sum(width(intersect(y, q)) / 1e6) - abd - bcd - abcd
+    cd <- sum(width(intersect(z, q)) / 1e6) - acd - bcd - abcd
+    
+    a <- sum(width(x) / 1e6) - ab - ac - ad - abc - abd - acd - abcd
+    b <- sum(width(y) / 1e6) - ab - bc - bd - abc - abd - bcd - abcd
+    c <- sum(width(z) / 1e6) - ac - bc - cd - abc - acd - bcd - abcd
+    d <- sum(width(q) / 1e6) - ad - bd - cd - abd - acd - bcd - abcd
+    
+    w <- Venn(SetNames = names.plot)
+    Weights(w) <- c(0, a, b, ab, c, ac, bc, abc, d, ad, bd, abd, cd, acd, bcd, abcd)
+
+  } else {
+    stop("This many objects is not supported.")
+  }
+  
+  plot(w, show = list(Faces = F))
+    
+  pdf(file_name, width = 4, height = 4)
+  plot(w, show = list(Faces = F))
+  dev.off()
+
+}
+
+```
+
+### 1. Set-up
+
+Set the parameters and read the pA-DamID data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(UpSetR)))
+suppressMessages(suppressWarnings(library(Vennerable)))
+suppressMessages(suppressWarnings(library(data.table)))
+
+# Prepare output 
+output_dir <- "ts190730_LADs_Venn"
+dir.create(output_dir, showWarnings = FALSE)
+
+input_dir_RDS <- "ts190727_pADamID_correlations"
+
+# Read chrom_sizes
+chrom_sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes", 
+                          row.names = 1, col.names = c("seqnames", "length"))
+
+
+# Read pA-DamID data
+padamid_hmm <- readRDS(file.path(input_dir_RDS, "padamid_hmm.rds"))
+bin_size <- readRDS(file.path(input_dir_RDS, "bin_size.rds"))
+
+# Get the experiment names
+#   (Note that my naming strategy is still a bit flawed)
+experiment_names <- names(mcols(padamid_hmm))
+
+```
+
+### 2. Load DamID LADs
+
+```{r read DamID LADs}
+
+# Set-up
+cells <- c("Hap1", "K562", "HCT116", "RPE")
+hmm_dir <- file.path("/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/",
+                     paste0("bin-", bin_size))
+
+filters <- paste(c("_r|4xAP3|CENP"),
+                 collapse = "|")
+
+hmm_files <- dir(hmm_dir, pattern = "HMM.txt.gz")
+hmm_files <- grep(hmm_files, pattern = paste(cells, collapse = "|"), value = T)
+hmm_files <- grep(hmm_files, pattern = filters, invert = T, value = T)
+damid_hmm <- ReadDamID(dir = hmm_dir, fnames = hmm_files, chrom_sizes = chrom_sizes)
+
+```
+
+
+```{r combine HMMs}
+
+# Create new object
+hmm <- damid_hmm
+names(mcols(hmm)) <- paste0("DamID_", names(mcols(hmm)))
+
+# Add pA-DamID columns
+mcols(hmm) <- cbind(mcols(hmm),
+                    mcols(padamid_hmm)[, c(paste0(c("Hap1", "K562", "HCT116"), 
+                                                  rep(c("_LMNB1", "_LMNB2"),
+                                                      each = 3)),
+                                           "pADamID-RPE_bulk_LMNB1",
+                                           "pADamID-RPE_bulk_LMNB2",
+                                           "pADamID-RPE_bulk_LMNAC")])
+
+
+```
+
+### 3. Venns
+
+```{r HMM overlap Vennerable, fig.width = 4, fig.height = 4}
+
+# Prepare output directories
+output_venn <- file.path(output_dir, "venn")
+dir.create(output_venn, showWarnings = FALSE)
+
+try(
+  PlotVennFromGRanges(hmm, c("DamID_Hap1_LMNB1", "Hap1_LMNB1", "Hap1_LMNB2"), 
+                      file.path(output_venn, "Hap1-Venn.pdf"))
+)
+try(
+  PlotVennFromGRanges(hmm, c("DamID_K562_LMNB1", "K562_LMNB1", "K562_LMNB2"),
+                      file.path(output_venn, "K562-Venn.pdf"))
+)
+try(
+  PlotVennFromGRanges(hmm, c("DamID_HCT116_LMNB1", "HCT116_LMNB1", "HCT116_LMNB2"), 
+                      file.path(output_venn, "HCT116-Venn.pdf"))
+)
+try(
+  PlotVennFromGRanges(hmm, c("DamID_RPE_LMNB1", 
+                             "pADamID-RPE_bulk_LMNB1",
+                             "pADamID-RPE_bulk_LMNB2", 
+                             "pADamID-RPE_bulk_LMNAC"), 
+                      file.path(output_venn, "RPE-Venn.pdf"))
+)
+
+
+```
+
+
+
+### Session info
+
+```{r session info}
+sessionInfo()
+```

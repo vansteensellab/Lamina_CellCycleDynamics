@@ -1,0 +1,164 @@
+---
+title: "Normalization figure"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+This document will make the normalization figure.
+
+
+### Method
+
+Simple base-R plotting. Data to plot (Hap1) :
+
+  * Dam
+  * H3K27me3
+  * Lamin B2
+  * H3K27me3 - normalized
+  # Lamin B2 - normalized
+  
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(RColorBrewer)))
+
+
+# 
+# Prepare output
+output_dir <- "ts190729_figure_track_RPEontheplate"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Load the data sets required
+file_names <- c("trypsin_b2", "ontheplate_b2", "trypsin_ac", "ontheplate_ac")
+
+trypsin_b2 <- import("../ts190509_RPE_HCT116_synchronization/results/tracks/normalized/bin-20kb/pADamID-RPE_bulk_LMNB2-20kb-combined.bw")
+ontheplate_b2 <- import("../ts190509_RPE_HCT116_synchronization/results/tracks/normalized/bin-20kb/pADamID-RPE_ontheplate_LMNB2-20kb-combined.bw")
+trypsin_ac <- import("../ts190509_RPE_HCT116_synchronization/results/tracks/normalized/bin-20kb/pADamID-RPE_bulk_LMNAC-20kb-combined.bw")
+ontheplate_ac <- import("../ts190509_RPE_HCT116_synchronization/results/tracks/normalized/bin-20kb/pADamID-RPE_ontheplate_LMNAC-20kb-combined.bw")
+
+data_tracks <- list(trypsin_b2, ontheplate_b2, trypsin_ac, ontheplate_ac)
+names(data_tracks) <- file_names
+
+# Let's combine the various bigwig files into one
+# First, create a GRanges with all the bins
+bins <- read.table("results/counts/bin-20kb/pADamID-Hap1_r4_Dam_semibad-Dam-20kb.counts.txt.gz",
+                   sep = "\t")[, 1:3]
+names(bins) <- c("seqnames", "start", "end")
+bins$start <- bins$start + 1
+bins <- as(bins, "GRanges")
+
+# Add the data
+mcols(bins)[, file_names] <- NA 
+
+for (i in file_names) {
+  track <- data_tracks[[i]]
+  ovl <- findOverlaps(track, bins)
+  mcols(bins)[subjectHits(ovl), i] <- track$score[queryHits(ovl)]
+}
+
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+
+### 1) Plot
+
+Plot a particular example region.
+
+```{r plot, fig.width = 6, fig.height = 4}
+
+PlotDataTracks <- function(bins, chr = "chr1", start = 1, end = 1e6) {
+  
+  # Get the data
+  data <- bins[seqnames(bins) == chr & 
+                 start(bins) >= start & 
+                 end(bins) <= end]
+  
+  data <- as(data, "data.frame")
+  
+  # Melt the data
+  data.melt <- melt(data, id.vars = c("seqnames", "start", "end", "width", "strand"))
+  data.melt <- data.melt[complete.cases(data.melt), ]
+  
+  # Plot the data
+  plt <- ggplot(data.melt, aes(xmin = start / 1e6, xmax = end / 1e6, ymin = 0, ymax = value,
+                               fill = variable)) +
+    geom_rect() +
+    geom_hline(yintercept = 0, size = 0.5) +
+    facet_grid(variable ~ ., scales = "free_y") +
+    xlab(paste0(chr, " (Mb)")) +
+    ylab("Score") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_brewer(palette = "Set1", guide = FALSE) +
+    theme_classic()
+  
+  plot(plt)
+  
+}
+
+PlotDataTracks(bins, 
+               chr = "chr1", start = 35e6, end = 70e6)
+
+```
+
+
+### Conclusion
+
+I need to decide and change the colors. This might be easier in illustrator, so 
+I won't bother with it now.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

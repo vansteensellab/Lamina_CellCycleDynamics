@@ -1,0 +1,220 @@
+---
+title: "Figure histone modifications"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+Make genome track of histone modifications in K562 cells.
+
+
+### Method
+
+Just a screenshot.
+  
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(tidyverse)))
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(RColorBrewer)))
+
+
+# 
+# Prepare output
+output_dir <- "ts200324_histone_modifications_track"
+dir.create(output_dir, showWarnings = FALSE)
+
+SaveDamID <- function(damid, bigwig.dir, file_end = ".bw") {
+  
+  # Save all as bigwig
+  dir.create(bigwig.dir, showWarnings = F)
+  
+  for (s in names(mcols(damid))) {
+    gr <- damid
+    mcols(gr) <- data.frame(score = mcols(gr)[, s])
+    gr <- gr[which(! is.na(gr$score))]
+    
+    export.bw(gr, file.path(bigwig.dir, paste0(s, file_end)))
+  }
+  
+}
+
+```
+
+The histone modification tracks are per-base bigwigs. I need 20kb tracks.
+
+```{r prepare bins}
+
+# Chrom sizes
+chrom.sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes", sep = "\t", header = F)
+row.names(chrom.sizes) <- chrom.sizes[, 1]
+
+# Get bins, with seqlengths
+bins <- read.table("results/counts/bin-20kb/pADamID-Hap1_r4_Dam_semibad-Dam-20kb.counts.txt.gz",
+                   sep = "\t")[, 1:3]
+names(bins) <- c("seqnames", "start", "end")
+bins$start <- bins$start + 1
+bins <- as(bins, "GRanges")
+
+seqlengths(bins) <- chrom.sizes[seqlevels(bins), 2]
+
+```
+
+```{r convert bigwig to binned bigwig, eval = F}
+
+# Run deeptools
+#multiBigwigSummary bins -b ts200324_K562_ChIPseq_H3K27me3_ENCFF914VFE.bigWig ts200324_K562_ChIPseq_H3K9me3_ENCFF812HRW.bigWig -l H3K27me3 H3K9me3 -o results.npz -bs 20000 --chromosomesToSkip chrY chrM -p 30 --outRawCounts counts.txt -v
+
+```
+
+```{r load data}
+
+# Load the data sets required
+file_names <- c("H3K27me3_pADamID", "H3K9me3_pADamID")
+
+H3K27me3_pADamID <- import("results/tracks/normalized/bin-20kb/K562_H3K27me3-20kb-combined.bw")
+H3K9me3_pADamID <- import("results/tracks/normalized/bin-20kb/pADamID-K562_r3_H3K9me3-20kb.bw")
+
+data_tracks <- list(H3K27me3_pADamID, H3K9me3_pADamID)
+names(data_tracks) <- file_names
+
+# Let's combine the various bigwig files into one
+# Add the data
+mcols(bins)[, file_names] <- NA 
+
+for (i in file_names) {
+  track <- data_tracks[[i]]
+  ovl <- findOverlaps(track, bins)
+  mcols(bins)[subjectHits(ovl), i] <- track$score[queryHits(ovl)]
+}
+
+# Add chip-seq
+chip <- read_tsv("ts200324_histone_modifications_track/counts.txt")
+names(chip) <- c("seqnames", "start", "end", "H3K27me3", "H3K9me3")
+chip <- as(chip, "GRanges")
+start(chip) <- start(chip) + 1
+chip <- sort(chip)
+chip <- chip[seqnames(chip) %in% seqlevels(bins)]
+
+ovl <- findOverlaps(chip, bins, select = "arbitrary", type = "any")
+mcols(bins)[, c("H3K27me3_ChIP", "H3K9me3_ChIP")] <- NA
+mcols(bins)[ovl, c("H3K27me3_ChIP", "H3K9me3_ChIP")] <- mcols(chip)
+
+mcols(bins) <- mcols(bins)[, c("H3K27me3_pADamID", "H3K27me3_ChIP",
+                               "H3K9me3_pADamID", "H3K9me3_ChIP")]
+
+# Save ChIP-seq as bigwig
+chip <- chip[seqnames(chip) %in% seqlevels(bins)]
+seqlevels(chip) <- seqlevels(bins)
+seqinfo(chip) <- seqinfo(bins)
+
+SaveDamID(chip, file.path(output_dir, "bigwig_histone"))
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+
+### 1) Plot
+
+Plot a particular example region.
+
+```{r plot, fig.width = 6, fig.height = 4}
+
+PlotDataTracks <- function(bins, chr = "chr1", start = 1, end = 1e6) {
+  
+  # Get the data
+  data <- bins[seqnames(bins) == chr & 
+                 start(bins) >= start & 
+                 end(bins) <= end]
+  
+  data <- as(data, "data.frame")
+  
+  # Melt the data
+  data.melt <- melt(data, id.vars = c("seqnames", "start", "end", "width", "strand"))
+  data.melt <- data.melt[complete.cases(data.melt), ]
+  
+  # Tweaking: color by pA-DamID / DamID
+  data.melt$class <- gsub("_.*", "", data.melt$variable)
+  data.melt$class <- factor(data.melt$class, levels = c("H3K27me3", "H3K9me3"))
+  
+  # Plot the data
+  plt <- ggplot(data.melt, aes(xmin = start / 1e6, xmax = end / 1e6, ymin = 0, ymax = value,
+                               fill = class)) +
+    geom_rect() +
+    geom_hline(yintercept = 0, size = 0.5) +
+    facet_grid(variable ~ ., scales = "free_y") +
+    xlab(paste0(chr, " (Mb)")) +
+    ylab("Score") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_brewer(palette = "Set1", guide = FALSE) +
+    theme_classic()
+  
+  plot(plt)
+  
+}
+
+PlotDataTracks(bins, 
+               chr = "chr1", start = 65e6, end = 100e6)
+
+```
+
+
+### Conclusion
+
+I need to decide and change the colors. This might be easier in illustrator, so 
+I won't bother with it now.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

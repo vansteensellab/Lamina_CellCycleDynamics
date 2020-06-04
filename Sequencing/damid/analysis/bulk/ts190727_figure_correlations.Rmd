@@ -1,0 +1,1597 @@
+---
+title: "Analyze pA-DamID - correlations"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+It's time to generate nice figures for a poster / potential publication. Let's 
+start with correlations plots between replicates and between different data 
+types (i.e. DamID / ChIP).
+
+
+### Method
+
+Simple correlation plots with general statistics to start with.
+
+```{r supporting functions}
+
+# Read DamID normalized values
+ReadDamID <- function(dir, fnames, 
+                      seqlevels = c(paste0("chr", 1:22), "chrX"),
+                      chrom_sizes) {
+  # Read in the normalized .txt file
+  # The 4th column is the score:
+  
+  # Process first file and create GRanges object
+  damid <- read.table(file.path(dir,
+                      fnames[1]),
+                      stringsAsFactors = FALSE)
+  names(damid) <- c("seqnames", "start", "end", 
+                    gsub("-\\d+kb.*", "", fnames[1]))
+  
+  damid <- as(damid, "GRanges")
+  
+  # Add the other files as columns
+  if (length(fnames) > 1) {
+    for (f in fnames[2:length(fnames)]) {
+      score <- read.table(file.path(dir,
+                                    f),
+                          stringsAsFactors = FALSE)[, 4]
+      mcols(damid)[gsub("-\\d+kb.*", "", f)] <- score
+    }
+  }
+  
+  # Set seqlevels if given
+  if (! is.null(seqlevels)) {
+    seqlevels(damid, pruning = "coarse") <- seqlevels
+  }
+  
+  # Set seqlengths
+  seqlengths(damid) <- chrom_sizes[seqlevels(damid), "length"]
+  
+  damid
+}
+
+```
+
+
+### Set-up
+
+Set the parameters and read the pA-DamID data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(edgeR)))
+
+# Bin size
+bin_size <- "20kb"
+
+# Prepare output 
+output_dir <- "ts190727_pADamID_correlations"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Read chrom_sizes
+chrom_sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes", 
+                          row.names = 1, col.names = c("seqnames", "length"))
+
+
+# Read pA-DamID data
+filters <- paste(c("shakeoff", "pADam-500d", "2ndrabbit", "Hap1_r1_LMNB1-10m",
+                   "Hap1_r1_LMNB1-2", "Hap1_r1_LMNB1-BSA", "Hap1_r1_LMNB1-RT",
+                   "Hap1_r2_LMNB1",
+                   "r4_LMNB.-100", "^DamID"),
+                 collapse = "|")
+
+# 1) Read the normalized values
+norm_dir = paste0("results/normalized/bin-", bin_size)
+norm_files <- dir(norm_dir, pattern = "norm.txt.gz")
+norm_files <- grep(norm_files, pattern = filters, invert = T, value = T)
+padamid_norm <- ReadDamID(dir = norm_dir, fnames = norm_files, chrom_sizes = chrom_sizes)
+
+# 2) Read the HMM calls
+hmm_dir = paste0("results/HMM/bin-", bin_size)
+hmm_files <- dir(hmm_dir, pattern = "HMM.txt.gz")
+hmm_files <- grep(hmm_files, pattern = filters, invert = T, value = T)
+padamid_hmm <- ReadDamID(dir = hmm_dir, fnames = hmm_files, chrom_sizes = chrom_sizes)
+
+
+# In another folder, additional files are present. Including RPE samples. Let's
+# add those.
+# Note: HCT116 bulk samples are already in the general object included (r3 and r4)
+filters <- paste(c("_pADam", "neg", "HCT116_sync-G2_r1", "HCT116_bulk"),
+                 collapse = "|")
+norm_dir2 <- paste0("../ts190509_RPE_HCT116_synchronization/results/normalized/bin-", bin_size)
+norm_files2 <- dir(norm_dir2, pattern = ".*norm.txt.gz")
+norm_files2 <- grep(norm_files2, pattern = filters, invert = T, value = T)
+padamid_norm2 <- ReadDamID(dir = norm_dir2, fnames = norm_files2, chrom_sizes = chrom_sizes)
+names(mcols(padamid_norm2)) <- paste0("Sync", names(mcols(padamid_norm2)))
+
+hmm_dir2 = paste0("../ts190509_RPE_HCT116_synchronization/results/HMM/bin-", bin_size)
+hmm_files2 <- dir(hmm_dir2, pattern = "HMM.txt.gz")
+hmm_files2 <- grep(hmm_files2, pattern = filters, invert = T, value = T)
+padamid_hmm2 <- ReadDamID(dir = hmm_dir2, fnames = hmm_files2, chrom_sizes = chrom_sizes)
+
+# For the sorted samples, remove bulk samples - too few reads (~3M total)
+filters <- paste(c("_pADam", "neg", "sync", "bulk"),
+                 collapse = "|")
+norm_dir3 <- paste0("../ts190301_pADamID_CellCycle/results/normalized/bin-", bin_size)
+norm_files3 <- dir(norm_dir3, pattern = ".*norm.txt.gz")
+norm_files3 <- grep(norm_files3, pattern = filters, invert = T, value = T)
+padamid_norm3 <- ReadDamID(dir = norm_dir3, fnames = norm_files3, chrom_sizes = chrom_sizes)
+names(mcols(padamid_norm3)) <- paste0("Cycle", names(mcols(padamid_norm3)))
+
+# Add to the other object
+mcols(padamid_norm) <- cbind(mcols(padamid_norm), 
+                             mcols(padamid_norm2),
+                             mcols(padamid_norm3))
+
+mcols(padamid_hmm) <- cbind(mcols(padamid_hmm), 
+                            mcols(padamid_hmm2))
+
+
+# Get the experiment names
+#   (Note that my naming strategy is still a bit flawed)
+experiment_names <- names(mcols(padamid_norm))
+
+
+# Repeat this for the DamID samples
+filters <- paste(c("_pADam", "neg", "4xAP3", "CENPB"),
+                 collapse = "|")
+norm_dir3 <- paste0("~/mydata/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/normalized/bin-", bin_size)
+norm_files3 <- dir(norm_dir3, pattern = ".*norm.txt.gz")
+norm_files3 <- grep(norm_files3, pattern = filters, invert = T, value = T)
+damid_norm <- ReadDamID(dir = norm_dir3, fnames = norm_files3, chrom_sizes = chrom_sizes)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+### 1) Between-replicate correlations
+
+First, between-replicate correlation plots to show reproducibility.
+
+I can use the fact that only replicate have "combined" data tracks to quickly 
+find all data sets with replicate. Of course, there can be 2+ replicates that
+I have to deal with. To make matters worse, "Hap1_r3" uses a flawed Dam-only and
+should be excluded from all analyses for now.
+
+For now, I will only plot the correlation for the (first) two replicates.
+
+```{r between-replicate correlations, fig.width = 4, fig.height = 4, warning = FALSE}
+
+# Find all experiments with replicates
+replicate_experiments <- grep(experiment_names, pattern = "DamID", invert = T, value = T)
+
+# For every replicate experiment, find the corresponding files and plot
+for (experiment in replicate_experiments) {
+  
+  # Get the individual files
+  cell <- strsplit(experiment, "_")[[1]][1]
+  target <- strsplit(experiment, "_")[[1]][2]
+  target.grep <- paste0("_", target)
+  
+  experiment_files <- grep("pADamID", 
+                           grep(cell, 
+                                grep(target.grep, experiment_names, value = T),
+                                value = T),
+                           value = T)
+  
+  # Filter Hap1 replicate 3 samples
+  if (cell == "Hap1") {
+    experiment_files <- grep(experiment_files, pattern = "r3", invert = T, value = T)
+  }
+  
+  # Get data & complete cases
+  experiments_norm <- as(mcols(padamid_norm)[, experiment_files], "data.frame")
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Rename columns
+  names(experiments_norm) <- paste0("r", 1:ncol(experiments_norm))
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$r1, experiments_norm$r2, method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$r1, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$r2, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = r1, y = r2)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, target, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("replicate 1") + 
+    ylab("replicate 2") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+```
+
+Overall, decent correlations. Some experiments are better than others, as 
+expected from the data.
+
+Note: something seemed off with the last NPMI experiment (K562 & HCT116). This 
+expains the ugly data set over there.
+
+
+### 2) Between-antibody correlations
+
+Now, I have used LMNB1 and LMNB2 antibodies for the data tracks. How consistent
+are these observations? Again, let's stick to the first replicate.
+
+```{r between-antibody correlations, fig.width = 4, fig.height = 4, warning = FALSE}
+
+# For every replicate experiment, find the corresponding files and plot
+for (cell in c("Hap1", "K562", "HCT116")) {
+  
+  # Get the individual files
+  LMNB1 <- grep("pADamID", 
+                grep(cell, 
+                     grep("LMNB1", experiment_names, value = T),
+                     value = T),
+                value = T)[1]
+  
+  LMNB2 <- grep("pADamID", 
+                grep(cell, 
+                     grep("LMNB2", experiment_names, value = T),
+                     value = T),
+                value = T)
+  LMNB2 <- LMNB2[length(LMNB2)]
+  
+  # Filter Hap1 replicate 3 samples
+  if (cell == "Hap1") {
+    experiment_files <- grep(experiment_files, pattern = "r3", invert = T, value = T)
+  }
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(LMNB1 = mcols(padamid_norm)[, LMNB1],
+                                 LMNB2 = mcols(padamid_norm)[, LMNB2])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$LMNB1, experiments_norm$LMNB2, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$LMNB1, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNB2, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB1, y = LMNB2)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("LMNB1") + 
+    ylab("LMNB2") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+# For every replicate experiment, find the corresponding files and plot
+for (cell in c("RPE")) {
+  
+  # Get the individual files
+  LMNB2 <- grep(cell, 
+                grep("bulk_r._LMNB2", experiment_names, value = T),
+                value = T)[2]
+  
+  LMNAC <- grep(cell, 
+                grep("bulk_r._LMNAC", experiment_names, value = T),
+                value = T)[1]
+  
+  # Filter Hap1 replicate 3 samples
+  if (cell == "Hap1") {
+    experiment_files <- grep(experiment_files, pattern = "r3", invert = T, value = T)
+  }
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(LMNB2 = mcols(padamid_norm)[, LMNB2],
+                                 LMNAC = mcols(padamid_norm)[, LMNAC])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$LMNB2, experiments_norm$LMNAC, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$LMNB2, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNAC, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB2, y = LMNAC)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("LMNB2") + 
+    ylab("LMNAC") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+
+
+# Also do this for the replicates combined
+for (cell in c("Hap1", "K562", "HCT116")) {
+  
+  # Get the individual files
+  LMNB1 <- grep("pADamID", 
+                          grep(cell, 
+                               grep("LMNB1", experiment_names, value = T),
+                               value = T),
+                          value = T, invert = T)[1]
+  
+  LMNB2 <- grep("pADamID", 
+                          grep(cell, 
+                               grep("LMNB2", experiment_names, value = T),
+                               value = T),
+                          value = T, invert = T)[1]
+  
+  
+  # Filter Hap1 replicate 3 samples
+  # if (cell == "Hap1") {
+  #   experiment_files <- grep(experiment_files, pattern = "r3", invert = T, value = T)
+  # }
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(LMNB1 = mcols(padamid_norm)[, LMNB1],
+                                 LMNB2 = mcols(padamid_norm)[, LMNB2])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$LMNB1, experiments_norm$LMNB2, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$LMNB1, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNB2, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB1, y = LMNB2)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("Lamin B1") + 
+    ylab("Lamin B2") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+for (cell in c("RPE")) {
+  
+  # Get the individual files
+  LMNB1 <- grep("_r", 
+                grep(cell, 
+                     grep("bulk_LMNB1", experiment_names, value = T),
+                     value = T),
+                value = T, invert = T)[1]
+  
+  LMNB2 <- grep("_r", 
+                grep(cell, 
+                     grep("bulk_LMNB2", experiment_names, value = T),
+                     value = T),
+                value = T, invert = T)[1]
+  
+  LMNAC <- grep("_r", 
+                grep(cell, 
+                     grep("bulk_LMNAC", experiment_names, value = T),
+                     value = T),
+                value = T, invert = T)[1]
+  
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(LMNB1 = mcols(padamid_norm)[, LMNB1],
+                                 LMNB2 = mcols(padamid_norm)[, LMNB2],
+                                 LMNAC = mcols(padamid_norm)[, LMNAC])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation_b1_b2 <- round(cor(experiments_norm$LMNB1,
+                                         experiments_norm$LMNB2, 
+                                         method = "pearson"),
+                                     digits = 2)
+  
+  pearson_correlation_b2_ac <- round(cor(experiments_norm$LMNB2,
+                                         experiments_norm$LMNAC, 
+                                         method = "pearson"),
+                                     digits = 2)
+  
+  pearson_correlation_b1_ac <- round(cor(experiments_norm$LMNB1,
+                                         experiments_norm$LMNAC, 
+                                         method = "pearson"),
+                                     digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$LMNB2, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNAC, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB2, y = LMNAC)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation_b2_ac)) +
+    xlab("Lamin B2") + 
+    ylab("Lamin A/C") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+  limits = range(c(quantile(experiments_norm$LMNB1, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNB2, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB1, y = LMNB2)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation_b1_b2)) +
+    xlab("Lamin B1") + 
+    ylab("Lamin B2") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+  limits = range(c(quantile(experiments_norm$LMNB1, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$LMNAC, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = LMNB1, y = LMNAC)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "-", 
+                  "r = ", pearson_correlation_b1_ac)) +
+    xlab("Lamin B1") + 
+    ylab("Lamin AC") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+```
+
+Overall, good correlations. Note that HCT116 only has 1 replicate, meaning that
+the LMNB1 & LMNB2 are from the same replicate and are normalized with the same
+Dam-only.
+
+
+### 3) Correlations with DamID
+
+Next, correlations with regular DamID. Again, for now just use the first 
+replicate.
+
+```{r pADamID - DamID correlations, fig.width = 4, fig.height = 4, warning = FALSE}
+
+# Set-up DamID data
+damid_dir <- paste0("/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/normalized/bin-", 
+                    bin_size)
+
+# For every replicate experiment, find the corresponding files and plot
+for (cell in c("Hap1", "K562", "HCT116")) {
+  
+  # Get the pA-DamID file
+  experiment_file <- grep("pADamID", 
+                          grep(cell, 
+                               grep("LMNB1", experiment_names, value = T),
+                               value = T),
+                          value = T)[1]
+  
+  # Get a matching DamID file
+  damid_file <- grep(cell,
+                     grep("LMNB1", 
+                          grep("r1", dir(damid_dir, pattern = "norm.txt.gz"), value = T),
+                          value = T),
+                     value = T)
+  damid_experiment <- ReadDamID(damid_dir, damid_file, chrom_sizes = chrom_sizes)
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                                 damid = mcols(damid_experiment)[, 1])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$damid, experiments_norm$padamid, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$padamid, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$damid, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = damid, y = padamid)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "LMNB1", "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("DamID") + 
+    ylab("pA-DamID") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+# Repeat for combined data track
+for (cell in c("Hap1", "K562", "HCT116", "RPE")) {
+  
+  # Get the pA-DamID file
+  experiment_file <- grep("_r", 
+                          grep(cell, 
+                               grep("LMNB1", experiment_names, value = T),
+                               value = T),
+                          value = T, invert = T)[1]
+  
+  # Get a matching DamID file
+  damid_file <- grep(cell,
+                     grep("LMNB1", 
+                          grep("combined", dir(damid_dir, pattern = "norm.txt.gz"), value = T),
+                          value = T),
+                     value = T)
+  damid_experiment <- ReadDamID(damid_dir, damid_file, chrom_sizes = chrom_sizes)
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                                 damid = mcols(damid_experiment)[, 1])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$damid, experiments_norm$padamid, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$padamid, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$damid, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = damid, y = padamid)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "LMNB1", "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("DamID") + 
+    ylab("pA-DamID") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+for (cell in c("Hap1", "K562", "HCT116", "RPE")) {
+  
+  # Get the pA-DamID file
+  experiment_file <- grep("_r", 
+                          grep(cell, 
+                               grep("LMNB2", experiment_names, value = T),
+                               value = T),
+                          value = T, invert = T)[1]
+  
+  # Get a matching DamID file
+  damid_file <- grep(cell,
+                     grep("LMNB1", 
+                          grep("combined", dir(damid_dir, pattern = "norm.txt.gz"), value = T),
+                          value = T),
+                     value = T)
+  damid_experiment <- ReadDamID(damid_dir, damid_file, chrom_sizes = chrom_sizes)
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                                 damid = mcols(damid_experiment)[, 1])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$damid, experiments_norm$padamid, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$padamid, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$damid, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = damid, y = padamid)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, "LMNB2", "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("DamID") + 
+    ylab("pA-DamID") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  print(plt)
+  
+}
+
+# Manual comparisons for RPE cells - assuming this damid file is still loaded
+# (see last loop above).
+# Also load the on-the-plate data set
+padamid_plate <- ReadDamID(file.path("../ts190509_RPE_HCT116_synchronization/results/normalized/", 
+                                     paste0("bin-", bin_size)),
+                           "pADamID-RPE_ontheplate_LMNB2-20kb-combined.norm.txt.gz", 
+                           chrom_sizes = chrom_sizes)
+
+experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                               ontheplate = mcols(padamid_plate)[, 1],
+                               damid = mcols(damid_experiment)[, 1])
+experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+
+# Calculate pearson correlation
+pearson_correlation_padamid.plate <- round(cor(experiments_norm$ontheplate, experiments_norm$padamid, 
+                                                method = "pearson"),
+                                            digits = 2)
+pearson_correlation_damid.plate <- round(cor(experiments_norm$damid, experiments_norm$ontheplate, 
+                                              method = "pearson"),
+                                          digits = 2)
+
+# Plot
+limits_padamid.plate = range(c(quantile(experiments_norm$padamid, 
+                                        c(0.001, 0.999)), 
+                               quantile(experiments_norm$ontheplate, 
+                                        c(0.001, 0.999)))) * 1.2
+limits_damid.plate = range(c(quantile(experiments_norm$damid, 
+                                      c(0.001, 0.999)), 
+                             quantile(experiments_norm$ontheplate, 
+                                      c(0.001, 0.999)))) * 1.2
+
+plt <- ggplot(experiments_norm, aes(x = padamid, y = ontheplate)) +
+  geom_bin2d(bins = 100) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  geom_smooth(method = "lm", col = "blue", se = FALSE) +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  ggtitle(paste(cell, "LMNB2", "-", 
+                "r = ", pearson_correlation_padamid.plate)) +
+  xlab("pA-DamID (trypsin)") + 
+  ylab("pA-DamID (on-the-plate)") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+print(plt)
+
+plt <- ggplot(experiments_norm, aes(x = damid, y = ontheplate)) +
+  geom_bin2d(bins = 100) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  geom_smooth(method = "lm", col = "blue", se = FALSE) +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  ggtitle(paste(cell, "LMNB2", "-", 
+                "r = ", pearson_correlation_damid.plate)) +
+  xlab("DamID") + 
+  ylab("pA-DamID (on-the-plate)") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+print(plt)
+
+
+# Update: also do this for Lamin AC
+padamid_plate_ac <- ReadDamID(file.path("../ts190509_RPE_HCT116_synchronization/results/normalized/", 
+                                        paste0("bin-", bin_size)),
+                              "pADamID-RPE_ontheplate_LMNAC-20kb-combined.norm.txt.gz", 
+                              chrom_sizes = chrom_sizes)
+
+experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                               ontheplate = mcols(padamid_plate_ac)[, 1])
+experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+
+# Calculate pearson correlation
+pearson_correlation_padamid.plate <- round(cor(experiments_norm$ontheplate, experiments_norm$padamid, 
+                                                method = "pearson"),
+                                            digits = 2)
+
+# Plot
+limits_padamid.plate = range(c(quantile(experiments_norm$padamid, 
+                                        c(0.001, 0.999)), 
+                               quantile(experiments_norm$ontheplate, 
+                                        c(0.001, 0.999)))) * 1.2
+
+plt <- ggplot(experiments_norm, aes(x = padamid, y = ontheplate)) +
+  geom_bin2d(bins = 100) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  geom_smooth(method = "lm", col = "blue", se = FALSE) +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  ggtitle(paste(cell, "LMNB2", "-", 
+                "r = ", pearson_correlation_padamid.plate)) +
+  xlab("pA-DamID (trypsin)") + 
+  ylab("pA-DamID (on-the-plate)") +
+  scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+print(plt)
+
+```
+
+The differences here are intruiging, as they represent snapshot vs prolonged
+lamina interactions.
+
+
+### 4) Correlations with ChIP
+
+This exercise will be a little bit more difficult, as I have to first process
+the ChIP-seq data in the same (bin size) format as the DamID. 
+
+
+```{r pADamID - ChIP correlations, fig.width = 4, fig.height = 4, warning = FALSE}
+
+# Create histone modification GRanges, similar to the pA-DamID one
+histone_modifications <- padamid_norm
+mcols(histone_modifications) <- NULL
+
+# First, run deeptools for convert "continuous" histone tracks into bins
+#cd ~/mydata/proj/tests/results/ts180813_GCF5083_pADamIDtests
+#multiBigwigSummary bins -b /DATA/usr/t.v.schaik/data/4DNucleome/GRCh38/ENCODE/K562/download/K562-ENCODE_ChIPseq_GRCh38_H3K27me3-human_r1,2_ENCFF914VFE.bigWig /DATA/usr/t.v.schaik/data/4DNucleome/GRCh38/ENCODE/K562/download/K562-ENCODE_ChIPseq_GRCh38_H3K9me3-human_r1,2_ENCFF812HRW.bigWig /DATA/usr/t.v.schaik/data/4DNucleome/GRCh38/HCT116/ENCODE/bigwig/HCT116-ENCODE_ChIPseq_GRCh38_H3K27me3-human_r1,2_ENCFF984BVG.bigWig /DATA/usr/t.v.schaik/data/4DNucleome/GRCh38/HCT116/ENCODE/bigwig/HCT116-ENCODE_ChIPseq_GRCh38_H3K9me3-human_r1,2_ENCFF542HPZ.bigWig --labels K562_H3K27me3 K562_H3K9me3 HCT116_H3K27me3 HCT116_H3K9me3 -out ts181123_histone_scores_per_bin.npz --outRawCounts ts181123_histone_scores_per_bin.tab -bs 20000
+
+# And read the deeptools output
+deeptools <- read.table("ts181123_histone_scores_per_bin.tab", sep = "\t", header = F,
+                        col.names = c("seqnames", "start", "end", "K562_H3K27me3", 
+                                      "K562_H3K9me3", "HCT116_H3K27me3", "HCT116_H3K9me3"))
+deeptools <- as(deeptools, "GRanges")
+seqlengths(deeptools) <- chrom_sizes[seqlevels(deeptools), "length"]
+
+# Add the values to the previously made GRanges
+ovl <- findOverlaps(histone_modifications, deeptools, type = "within")
+mcols(histone_modifications) <- mcols(deeptools[subjectHits(ovl)])
+
+# I will also write .bigwig files of the binned histone modifications, for 
+# genome browser screenshots.
+for (mark in names(mcols(histone_modifications))) {
+  
+  # Get the ranges
+  gr <- histone_modifications
+  mcols(gr) <- mcols(histone_modifications)[, mark]
+  names(mcols(gr)) <- "score"
+  
+  # Remove NA bins from the bigwig and fix start / end
+  gr <- gr[! is.na(mcols(gr)$score)]
+  start(gr) <- start(gr) + 1
+  gr <- trim(gr)
+  
+  # Create bigwig
+  file_name <- paste0("ChIPseq-", mark, "-", bin_size, ".bw")
+  
+  export.bw(gr,
+            file.path(output_dir,
+                      file_name))
+}
+
+# Now, I can create the correlation plots, but only for K562 H3K27me3 and H3K9me3
+
+# For every replicate experiment, find the corresponding files and plot
+for (target in c("H3K27me3", "H3K9me3")) {
+  
+  # Get the pA-DamID file
+  cell <- "K562"
+  experiment_file <- grep("pADamID", 
+                          grep(cell, 
+                               grep(target, experiment_names, value = T),
+                               value = T),
+                          value = T)[1]
+  
+  # Get a matching DamID file
+  histone_file <- grep(cell, 
+                       grep(target, names(mcols(histone_modifications)),
+                            value = T),
+                       value = T)
+  
+  # Get data & complete cases
+  experiments_norm <- data.frame(padamid = mcols(padamid_norm)[, experiment_file],
+                                 chip = mcols(histone_modifications)[, histone_file])
+  experiments_norm <- experiments_norm[complete.cases(experiments_norm), ]
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(log2(experiments_norm$chip), experiments_norm$padamid, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  # Plot
+  limits = range(c(quantile(experiments_norm$padamid, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$chip, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = log2(chip), y = padamid)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, target, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("ChIP (log2)") + 
+    ylab("pA-DamID") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1) #+
+    #coord_fixed()
+  
+  print(plt)
+
+  
+  # Now, I will repeat this plot for a linearized pA-DamID signal, that can 
+  # better compare the data sets
+  experiments_norm$padamid <- 2^experiments_norm$padamid
+  
+  # Calculate pearson correlation
+  pearson_correlation <- round(cor(experiments_norm$chip, experiments_norm$padamid, 
+                                    method = "pearson"),
+                                digits = 2)
+  
+  limits = range(c(quantile(experiments_norm$padamid, 
+                            c(0.001, 0.999)), 
+                   quantile(experiments_norm$chip, 
+                            c(0.001, 0.999)))) * 1.2
+  
+  plt <- ggplot(experiments_norm, aes(x = chip, y = padamid)) +
+    geom_bin2d(bins = 100) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+    geom_smooth(method = "lm", col = "blue", se = FALSE) +
+    #xlim(limits[1], limits[2]) +
+    ylim(limits[1], limits[2]) +
+    ggtitle(paste(cell, target, "-", 
+                  "r = ", pearson_correlation)) +
+    xlab("ChIP") + 
+    ylab("pA-DamID (not log2)") +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)#+
+    #coord_fixed()
+  
+  print(plt)
+  
+  
+  # Finally, let's also create a linearized .bw track of the DamID sample
+  # Get the ranges
+  gr <- padamid_norm
+  mcols(gr) <- 2^mcols(padamid_norm)[, experiment_file]
+  names(mcols(gr)) <- "score"
+  
+  # Remove NA bins from the bigwig and fix start / end
+  gr <- gr[! is.na(mcols(gr)$score)]
+  start(gr) <- start(gr) + 1
+  gr <- trim(gr)
+  
+  # Create bigwig
+  file_name <- paste0("pADamID-", cell, "-", target, "-", bin_size, ".bw")
+  
+  export.bw(gr,
+            file.path(output_dir,
+                      file_name))
+
+}
+
+
+```
+
+As you can see, the correlations are a bit messy. Still, not that bad.
+
+
+### 5) PCA plots
+
+How to combine all information in one plot: PCA. Let's try that, for the 
+replicates, antibodies & DamID-pADamID comparison.
+
+Alternative to PCA plots (showing 2 dimensions) are MDS plots. These have the
+advantage of being non-linear and can capture most data in 2 dimensions.
+
+
+```{r prepare samples df}
+
+# Get the mcols
+df.padamid <- as(mcols(padamid_norm), "data.frame")
+df.padamid <- df.padamid[, grep("_r", names(df.padamid))]
+df.damid <- as(mcols(damid_norm), "data.frame")
+df.damid <- df.damid[, grep("_r", names(df.damid))]
+
+# And create samples summaries
+# 1) pA-DamID
+padamid.samples.df <- data.frame(sample = names(df.padamid),
+                                 name = gsub(".*pADamID-", "", names(df.padamid)),
+                                 stringsAsFactors = FALSE)
+
+# Finally, I want to manually set the factor levels for (in my opinion) the 
+# best order.
+# Note: I have to take into account these outliers
+idx <- grep("(bulk|ontheplate|sync|_G1_|_S_|_G2_)", names(df.padamid))
+
+# Get the cell
+padamid.samples.df$cell <- sapply(padamid.samples.df$name, 
+                                  function(x) strsplit(x, "_")[[1]][1])
+padamid.samples.df$cell <- factor(padamid.samples.df$cell, 
+                                  unique(padamid.samples.df$cell))
+
+# Get the replicate
+padamid.samples.df$rep <- sapply(padamid.samples.df$name, 
+                                 function(x) strsplit(x, "_")[[1]][2])
+padamid.samples.df$rep[idx] <- sapply(padamid.samples.df$name[idx], 
+                                      function(x) strsplit(x, "_")[[1]][3])
+padamid.samples.df$rep <- factor(padamid.samples.df$rep, 
+                                 unique(padamid.samples.df$rep))
+
+# Get the target - and filter for lamina components
+padamid.samples.df$target <- sapply(padamid.samples.df$name, 
+                                    function(x) strsplit(x, "_")[[1]][3])
+padamid.samples.df$target[idx] <- sapply(padamid.samples.df$name[idx], 
+                                         function(x) strsplit(x, "_")[[1]][4])
+
+padamid.samples.df$treatment <- "-"
+padamid.samples.df$treatment[idx] <- sapply(padamid.samples.df$name[idx], 
+                                            function(x) strsplit(x, "_")[[1]][2])
+padamid.samples.df$treatment[padamid.samples.df$treatment %in% c("ontheplate", "bulk")] <- "-"
+
+padamid.samples.df$treatment <- factor(padamid.samples.df$treatment, 
+                                       levels = c("-", "G1", "S", "G2",
+                                                  "sync-G1", "sync-G2"))
+
+padamid.samples.df$target <- gsub("-.*", "", padamid.samples.df$target)
+keep <- which(padamid.samples.df$target %in% 
+                c("LMNB1", "LMNB2", "LMNAC"))
+padamid.samples.df <- padamid.samples.df[keep, ]
+df.padamid <- df.padamid[, keep]
+
+padamid.samples.df$target <- factor(padamid.samples.df$target, 
+                                    unique(padamid.samples.df$target))
+
+# Determine whether the pA-DamID was done "on the plate"
+padamid.samples.df$onplate <- ifelse(grepl("ontheplate", padamid.samples.df$name),
+                                     "ontheplate", "trypsin")
+padamid.samples.df$onplate <- factor(padamid.samples.df$onplate, 
+                                     levels = c("ontheplate", "trypsin"))
+
+# Finally, Hap1 replicate 3 is a bad sample - remove this one
+keep <- grep("Hap1_r3", 
+             padamid.samples.df$name, 
+             invert = T)
+padamid.samples.df <- padamid.samples.df[keep, ]
+df.padamid <- df.padamid[, keep]
+
+padamid.samples.df$method = "pA-DamID"
+
+# Save this object for 4DN data submission
+saveRDS(padamid.samples.df, file.path(output_dir,
+                                      "samples_padamid.rds"))
+
+
+# 2) DamID
+damid.samples.df <- data.frame(sample = names(df.damid),
+                               name = names(df.damid),
+                               stringsAsFactors = FALSE)
+
+# Finally, I want to manually set the factor levels for (in my opinion) the 
+# best order.
+# Get the cell
+damid.samples.df$cell <- sapply(damid.samples.df$name, 
+                                function(x) strsplit(x, "_")[[1]][1])
+damid.samples.df$cell <- factor(damid.samples.df$cell, 
+                                unique(damid.samples.df$cell))
+
+# Get the replicate
+damid.samples.df$rep <- sapply(damid.samples.df$name, 
+                               function(x) strsplit(x, "_")[[1]][2])
+damid.samples.df$rep <- factor(damid.samples.df$rep, 
+                               unique(damid.samples.df$rep))
+
+# Get the target - and filter for lamina components
+damid.samples.df$target <- sapply(damid.samples.df$name, 
+                                  function(x) strsplit(x, "_")[[1]][3])
+damid.samples.df$target <- factor(damid.samples.df$target, 
+                                  unique(damid.samples.df$target))
+
+damid.samples.df$treatment <- "-"
+damid.samples.df$onplate <- "ontheplate"
+damid.samples.df$method = "DamID"
+
+```
+
+```{r PCA, fig.width = 7, fig.height = 3.5}
+
+CreatePCAPlot <- function(cell, shape_feature = "cell", col_feature = "method",
+                          filter_string = NULL, random_order = TRUE) {
+  
+  # Get the pA-DamID & DamID data
+  idx.padamid <- grep(cell, padamid.samples.df$cell)
+  idx.damid <- grep(cell, damid.samples.df$cell)
+  
+  df <- cbind(df.padamid[, idx.padamid],
+              df.damid[, idx.damid])
+  df.samples <- rbind(padamid.samples.df[idx.padamid, ],
+                      damid.samples.df[idx.damid, ])
+  
+  if (! is.null(filter_string)) {
+    idx <- grep(filter_string, df.samples$name, invert = T)
+    df <- df[, idx]
+    df.samples <- df.samples[idx, ]
+  }
+  
+  # Scale the data - to make things a bit more comparable
+  df <- scale(df)
+  
+  # I need to remove missing values
+  df <- df[complete.cases(df), ]
+  
+  # PCA
+  pca <- prcomp(t(df), center = T, scale = T)
+  df.pca <- data.frame(pca$x)
+  df.pca <- cbind(df.pca[, 1:4], df.samples)
+  
+  if (random_order) df.pca <- df.pca[sample(1:nrow(df.pca), nrow(df.pca)), ]
+  
+  # Plot components PC1 and PC2
+  plt <- ggplot(df.pca, aes(x = PC1, y = PC2)) +
+    geom_point(size = 2.5, aes_string(shape = shape_feature, 
+                                    fill = col_feature),
+               col = "black") +
+    xlab(paste0("PC1 (",
+                round(summary(pca)[6][["importance"]][2, 1] * 100, 1),
+                "%)")) +
+    ylab(paste0("PC2 (",
+                round(summary(pca)[6][["importance"]][2, 2] * 100, 1),
+                "%)")) +
+    ggtitle("PCA plot") +
+    scale_fill_brewer(palette = "Set1") +
+    scale_shape_manual(values = c(21:(21+length(unique(df.samples[, shape_feature]))-1))) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+}
+
+# All cells
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "G1|S|G2")
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+CreatePCAPlot(cell = "(Hap1|HCT116|K562)", filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "G1|S|G2",
+              col_feature = "interaction(method, onplate)")
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "G1|S|G2",
+              col_feature = "interaction(method, target)")
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "G1|S|G2",
+              col_feature = "interaction(method, onplate, target)")
+
+CreatePCAPlot(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+
+# Every cell
+CreatePCAPlot("Hap1", shape_feature = "target", filter_string = "G1|S|G2")
+CreatePCAPlot("K562", shape_feature = "target", filter_string = "G1|S|G2")
+CreatePCAPlot("HCT116", shape_feature = "target", filter_string = "G1|S|G2")
+CreatePCAPlot("HCT116", shape_feature = "target", filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+CreatePCAPlot("RPE", shape_feature = "target", filter_string = "G1|S|G2")
+
+CreatePCAPlot("RPE", shape_feature = "onplate")
+
+```
+
+### 6) MDS plots
+
+```{r MDS plots, fig.width = 7, fig.height = 3.5}
+
+CreateMDSPlot <- function(cell, shape_feature = "cell", col_feature = "method", 
+                          filter_string = NULL, random_order = TRUE, ...) {
+  
+  # Get the pA-DamID & DamID data
+  idx.padamid <- grep(cell, padamid.samples.df$cell)
+  idx.damid <- grep(cell, damid.samples.df$cell)
+  
+  df <- cbind(df.padamid[, idx.padamid],
+              df.damid[, idx.damid])
+  df.samples <- rbind(padamid.samples.df[idx.padamid, ],
+                      damid.samples.df[idx.damid, ])
+  
+  # Filter undesired samples
+  if (! is.null(filter_string)) {
+    idx <- grep(filter_string, df.samples$name, invert = T)
+    df <- df[, idx]
+    df.samples <- df.samples[idx, ]
+  }
+  
+  # Scale the data - to make things a bit more comparable
+  df <- scale(df)
+  
+  # I need to remove missing values
+  df <- df[complete.cases(df), ]
+  
+  # MDS - using plotMDS from edgeR
+  mds <- plotMDS(df, plot = F, ...)
+  df.mds <- data.frame(mds$cmdscale.out)
+  names(df.mds) <- c("dim1", "dim2")
+  
+  df.mds <- cbind(df.mds, df.samples)
+  
+  if (random_order) df.mds <- df.mds[sample(1:nrow(df.mds), nrow(df.mds)), ]
+  
+  # Plot components dim1 and dim2
+  plt <- ggplot(df.mds, aes(x = dim1, y = dim2)) +
+    geom_point(size = 2.5, aes_string(shape = shape_feature, 
+                                    fill = col_feature),
+               col = "black") +
+    xlab("dim1") +
+    ylab("dim2") +
+    ggtitle("MDS plot") +
+    scale_fill_brewer(palette = "Set1") +
+    scale_shape_manual(values = c(21:(21+length(unique(df.samples[, shape_feature]))-1))) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+}
+
+# All cells
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "G1|S|G2")
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+CreateMDSPlot(cell = "(Hap1|HCT116|K562)", top = Inf, filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "G1|S|G2",
+              col_feature = "interaction(method, onplate)")
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "G1|S|G2",
+              col_feature = "interaction(method, target)")
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "G1|S|G2",
+              col_feature = "interaction(method, onplate, target)")
+
+CreateMDSPlot(cell = "(Hap1|RPE|HCT116|K562)", top = Inf, filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+
+# Every cell
+CreateMDSPlot("Hap1", shape_feature = "target", top = Inf, filter_string = "G1|S|G2")
+CreateMDSPlot("K562", shape_feature = "target", top = Inf, filter_string = "G1|S|G2")
+CreateMDSPlot("HCT116", shape_feature = "target", top = Inf, filter_string = "G1|S|G2")
+CreateMDSPlot("HCT116", shape_feature = "target", top = Inf, filter_string = "sync",
+              col_feature = "interaction(method, treatment)")
+CreateMDSPlot("RPE", shape_feature = "target", top = Inf, filter_string = "G1|S|G2")
+
+CreateMDSPlot("RPE", shape_feature = "onplate", top = Inf, filter_string = "G1|S|G2")
+
+```
+
+
+### 7) Correlation heatmap
+
+As alternative to PCA / MDS plots, I can also make a correlation heatmap. Let's
+give that a go.
+
+```{r cor heatmap, fig.width = 8, fig.height = 6}
+
+library(ComplexHeatmap)
+library(circlize)
+
+CreateCorHeatmap <- function(cell, method = "pearson", col_range = NULL,
+                             filter_string = NULL) {
+  
+  # Get the pA-DamID & DamID data
+  idx.padamid <- grep(cell, padamid.samples.df$cell)
+  idx.damid <- grep(cell, damid.samples.df$cell)
+  
+  df <- cbind(df.padamid[, idx.padamid],
+              df.damid[, idx.damid])
+  df.samples <- rbind(padamid.samples.df[idx.padamid, ],
+                      damid.samples.df[idx.damid, ])
+  
+  # Filter undesired samples
+  if (! is.null(filter_string)) {
+    idx <- grep(filter_string, df.samples$name, invert = T)
+    df <- df[, idx]
+    df.samples <- df.samples[idx, ]
+  }
+  
+  # Scale the data - to make things a bit more comparable
+  df <- data.frame(scale(df))
+  
+  # I need to remove missing values
+  df <- df[complete.cases(df), ]
+  names(df) <- paste(df.samples$method, gsub("-.*", "", df.samples$name), sep = "_")
+  
+  # Correlation
+  df.cor <- cor(df, method = method)
+  
+  # Make heatmap
+  ha = HeatmapAnnotation(#cell = df.samples$cell,
+                         method = df.samples$method,
+                         target = df.samples$target, 
+                         onplate = df.samples$onplate,
+                         treatment = df.samples$treatment)
+  # col = list(cell = c("Hap1" = "blue", "K562" = "red", 
+  #                     "HCT116" = "green", "RPE" = "purple"),
+  #            method = c("DamID" = "blue", "pA-DamID" = "red"),
+  #            target = c("LMNB1" = "green", "LMNB2" = "yellow", "LMNAC" = "grey"),
+  #            onplate = c("ontheplate" = "brown", "trypsin" = "purple"))
+  
+  if (is.null(col_range)) {
+    col_range <- c(min(df.cor) - 0.1, 1)
+  }
+
+  col_fun = colorRamp2(col_range, c("white", "steelblue"))
+  # col_fun <- colorRamp2(c(-1, 0, 1), c("blue", "#EEEEEE", "red"))
+  
+  Heatmap(df.cor, name = "pearson", top_annotation = ha, col = col_fun,
+          show_row_names = FALSE, show_column_names = FALSE,
+          row_split = df.samples$cell, column_split = df.samples$cell,
+          heatmap_width = unit(5, "inch"), heatmap_height = unit(5, "inch"))
+  
+}
+
+# All cells
+CreateCorHeatmap(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "G1|S|G2")
+CreateCorHeatmap(cell = "(Hap1|RPE|HCT116|K562)", filter_string = "sync")
+
+# Every cell
+CreateCorHeatmap("Hap1", filter_string = "G1|S|G2")
+CreateCorHeatmap("Hap1", filter_string = "sync")
+CreateCorHeatmap("K562", filter_string = "G1|S|G2")
+CreateCorHeatmap("K562", filter_string = "sync")
+CreateCorHeatmap("HCT116", filter_string = "G1|S|G2")
+CreateCorHeatmap("HCT116", filter_string = "sync")
+CreateCorHeatmap("RPE", filter_string = "G1|S|G2")
+
+```
+
+### 8) Data tracks
+
+Finally, some additional data tracks for the supplementary?
+
+```{r data tracks, fig.width = 6, fig.height = 4}
+
+PlotDataTracks <- function(bins, chr = "chr1", start = 1, end = 1e6) {
+  
+  # Get the data
+  data <- bins[seqnames(bins) == chr & 
+                 start(bins) >= start & 
+                 end(bins) <= end]
+  
+  data <- as(data, "data.frame")
+  
+  # Melt the data
+  data.melt <- melt(data, id.vars = c("seqnames", "start", "end", "width", "strand"))
+  data.melt <- data.melt[complete.cases(data.melt), ]
+  
+  # Plot the data
+  plt <- ggplot(data.melt, aes(xmin = start / 1e6, xmax = end / 1e6, ymin = 0, ymax = value,
+                               fill = variable)) +
+    geom_rect() +
+    geom_hline(yintercept = 0, size = 0.5) +
+    facet_grid(variable ~ ., scales = "free_y") +
+    xlab(paste0(chr, " (Mb)")) +
+    ylab("Score") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_brewer(palette = "Set1", guide = FALSE) +
+    theme_classic()
+  
+  plot(plt)
+  
+}
+
+# Hap1 Lamin B1 vs Lamin B2 + RPE Lamin B2 vs Lamin AC
+data <- padamid_norm
+mcols(data) <- mcols(data)[, c("pADamID-Hap1_r1_LMNB1-500d",
+                               "pADamID-Hap1_r7_LMNB2",
+                               "SyncpADamID-RPE_bulk_r3_LMNB2",
+                               "SyncpADamID-RPE_ontheplate_r6_LMNAC")]
+PlotDataTracks(data, 
+               chr = "chr1", start = 35e6, end = 70e6)
+
+# Combined replicates
+data <- padamid_norm
+mcols(data) <- mcols(data)[, c("Hap1_LMNB1",
+                               "Hap1_LMNB2",
+                               "SyncpADamID-RPE_bulk_LMNB2",
+                               "SyncpADamID-RPE_ontheplate_LMNAC")]
+PlotDataTracks(data, 
+               chr = "chr1", start = 35e6, end = 70e6)
+
+```
+
+
+
+### 9) Correlations with DamID
+
+I want to show that DamID correlates strongest with the G2 cell cycle phase.
+
+```{r correlations with DamID, fig.width = 5, fig.height = 3.5}
+
+# Loop over the cells
+df.cor <- c()
+
+for (cell in c("Hap1", "HCT116", "K562")) {
+  
+  # Get the mean DamID signal
+  df <- data.frame(damid = rowMeans(df.damid[, grep(cell, names(df.damid))]))
+  
+  # Add the cell cycle data
+  df <- cbind(df,
+              df.padamid[, grep(paste0("CyclepADamID-", cell),
+                                names(df.padamid))])
+  
+  # Correlation - pearson
+  df.cor.cell <- data.frame(cor(df, use = "complete", method = "pearson"))
+  
+  # Annotate
+  df.cor.cell <- df.cor.cell[row.names(df.cor.cell) != "damid", ]
+  df.cor.cell$cell <- cell
+  df.cor.cell$phase <- sapply(strsplit(x = names(df)[2:ncol(df)],
+                                       split = "_"),
+                              function(x) x[2])
+  df.cor.cell$rep <- sapply(strsplit(x = names(df)[2:ncol(df)],
+                                     split = "_"),
+                            function(x) x[3])
+  
+  df.cor <- rbind(df.cor, df.cor.cell[, c("damid", "cell", "phase", "rep")])
+  
+}
+
+df.cor$phase <- factor(df.cor$phase, levels = c("G1", "S", "G2"))
+
+# Plot the data
+plt <- ggplot(df.cor, aes(x = cell, y = damid, col = phase, group = phase)) +
+  # stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), position=position_dodge(0.3),
+  #              geom = "errorbar", width = 0.2) +
+  # stat_summary(fun.y = mean, geom = "point", position=position_dodge(0.3)) +
+  geom_point(position = position_dodge(0.3)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_color_grey(labels = c("G1", "mid-S", "G2")) +
+  ylim(0.8, 1) +
+  xlab("") +
+  ylab("Correlation") +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+plot(plt)
+
+plt <- ggplot(df.cor, aes(x = phase, y = damid)) +
+  #stat_summary(fun.y = mean, geom = "line", aes(group = 1)) +
+  stat_summary(fun.y = mean, geom = "point", shape="\U2014", size = 5, col = "blue") +
+  geom_point(aes(col = rep), size = 2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_color_grey() +
+  facet_grid(. ~ cell) +
+  ylim(0.8, 1) +
+  xlab("") +
+  ylab("Correlation") +
+  theme_classic() +
+  theme(aspect.ratio = 3,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+cairo_pdf("ts190727_pADamID_correlations/damid_correlation.pdf", width = 5, height = 3.5)
+plot(plt)
+dev.off()
+
+
+
+
+```
+
+```{r correlations with DamID for RPE, fig.width = 5, fig.height = 3.5}
+
+# First, I need to load the RPE data (not done in this document before)
+filters <- paste(c("_pADam", "neg", "sync", "bulk", "_0h", "combined"),
+                 collapse = "|")
+norm_dir4 <- paste0("../ts190509_RPE_shakeOff/results/normalized/bin-", bin_size)
+norm_files4 <- dir(norm_dir4, pattern = ".*norm.txt.gz")
+norm_files4 <- grep(norm_files4, pattern = filters, invert = T, value = T)
+padamid_norm4 <- ReadDamID(dir = norm_dir4, fnames = norm_files4, chrom_sizes = chrom_sizes)
+names(mcols(padamid_norm4)) <- paste0("ShakeOff-", names(mcols(padamid_norm4)))
+
+
+
+# Get the data combined in one object
+df.cor <- c()
+
+cell <- "RPE"
+  
+# Get the mean DamID signal
+df <- data.frame(damid = rowMeans(df.damid[, grep(cell, names(df.damid))]))
+
+# Add the cell cycle data
+df <- cbind(df,
+            as(mcols(padamid_norm4), "data.frame"))
+
+
+
+# Correlation - pearson
+df.cor.cell <- data.frame(cor(df, use = "complete", method = "pearson"))
+
+# Annotate
+df.cor.cell <- df.cor.cell[row.names(df.cor.cell) != "damid", ]
+df.cor.cell$cell <- cell
+df.cor.cell$phase <- sapply(strsplit(x = names(df)[2:ncol(df)],
+                                     split = "_"),
+                            function(x) x[2])
+df.cor.cell$rep <- sapply(strsplit(x = names(df)[2:ncol(df)],
+                                   split = "_"),
+                          function(x) x[3])
+
+df.cor <- rbind(df.cor, df.cor.cell[, c("damid", "cell", "phase", "rep")])
+
+df.cor$phase <- factor(df.cor$phase, levels = c("1h", "3h", "6h", "10h", "21h"))
+
+# Plot the data
+# plt <- ggplot(df.cor, aes(x = phase, y = damid, col = phase, group = phase)) +
+#   # stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), position=position_dodge(0.3),
+#   #              geom = "errorbar", width = 0.2) +
+#   # stat_summary(fun.y = mean, geom = "point", position=position_dodge(0.3)) +
+#   geom_point(position = position_dodge(0.3)) +
+#   geom_hline(yintercept = 1, linetype = "dashed") +
+#   scale_color_grey(labels = c("G1", "mid-S", "G2")) +
+#   #ylim(0.8, 1) +
+#   xlab("") +
+#   ylab("Correlation") +
+#   theme_classic() +
+#   theme(aspect.ratio = 1)
+# 
+# plot(plt)
+
+plt <- ggplot(df.cor, aes(x = phase, y = damid)) +
+  #stat_summary(fun.y = mean, geom = "line", aes(group = 1)) +
+  stat_summary(fun.y = mean, geom = "point", shape="\U2014", size = 5, col = "blue") +
+  geom_point(aes(col = rep), size = 2) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_color_grey() +
+  facet_grid(. ~ cell) +
+  #ylim(0.8, 1) +
+  xlab("") +
+  ylab("Correlation") +
+  theme_classic() +
+  theme(aspect.ratio = 2,
+        axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+cairo_pdf("ts190727_pADamID_correlations/damid_correlation_RPE.pdf", width = 5, height = 3.5)
+plot(plt)
+dev.off()
+
+
+
+
+```
+
+
+### Conclusions
+
+Overall, these correlations show that:
+
+  1. pA-DamID has a high reproducibility, especially for good antibodies + good 
+     data sets.
+  2. Different antibodies (LMNB1, LMNB2) can generate very consistent data 
+     tracks.
+  3. pA-DamID and DamID data sets correspond very well, although small 
+     differerences in signal suggest variation in interaction time.
+  4. pA-DamID and ChIP data sets correspond quite well, although this is very
+     dependent on the quality of the data sets.
+
+I think these figures are done.
+
+
+### Save files
+
+For later analyses, it will be handy to have the R objects made here available. 
+Let's save them.
+
+```{r save files}
+
+# Save .rds files
+saveRDS(padamid_norm,
+        file.path(output_dir, "padamid_norm.rds"))
+saveRDS(padamid_hmm,
+        file.path(output_dir, "padamid_hmm.rds"))
+saveRDS(bin_size,
+        file.path(output_dir, "bin_size.rds"))
+
+```
+
+
+### Session info
+
+```{r session info}
+sessionInfo()
+```

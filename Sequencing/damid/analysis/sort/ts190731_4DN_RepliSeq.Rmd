@@ -1,0 +1,313 @@
+---
+title: "Repliseq"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+In this document, I will load the (5kb) binned repliseq tracks and generate 
+normalized (and combined) repliseq tracks in 5kb and 20kb. 
+
+### Method
+
+General R & BioConductor coding.
+  
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(dplyr)))
+suppressMessages(suppressWarnings(library(readr)))
+
+
+# Prepare output
+output_dir <- "ts190731_4DN_RepliSeq"
+dir.create(output_dir, showWarnings = FALSE)
+input_dir <- file.path(output_dir, "4dn_files")
+
+# Load the metadata
+metadata <- read_delim(file.path(output_dir,
+                                 "metadata_2019-07-31-14h-23m.tsv"), 
+                       delim = "\t", skip = 1)
+metadata <- metadata %>% filter(`File Format` == "bg")
+
+metadata$experiment <- paste0(gsub(" .*", "", metadata$Biosource), "_",
+                              "r", metadata$`Bio Rep No`, "_",
+                              gsub(" .*", "", gsub("Fraction: ", "", metadata$`Assay Details`)))
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+
+### 1) Load the counts
+
+Read the counts.
+
+```{r load counts} 
+
+counts <- NULL
+
+for (i in 1:nrow(metadata)) {
+  
+  # Load counts
+  x <- import(file.path(input_dir,
+                        paste0(metadata$`File Accession`[i], ".bedGraph.gz")))
+  
+  # Add to counts
+  if (is.null(counts)) {
+    counts <- x
+  } else {
+    mcols(counts) <- cbind(mcols(counts),
+                           x$score)
+  }
+}
+
+names(mcols(counts)) <- metadata$experiment
+
+```
+
+And filter these for chromosomes (chr1-22 + chrX).
+
+```{r filter chromosomes}
+
+counts <- counts[seqnames(counts) %in% c(paste0("chr", 1:22),
+                                         "chrX")]
+
+```
+
+And normalized to 1M reads.
+
+```{r normalize reads}
+
+mcols(counts) <- t(t(as(mcols(counts), "data.frame")) / colSums(as(mcols(counts), "data.frame"))) * 1e6
+
+```
+
+Finally, also combine them into 20kb bins.
+
+```{r combine into 20kb bins}
+
+# Load chromosomes
+chrom_info <- read.table("~/mydata/data/genomes/GRCh38/hg38.chrom.sizes", sep = "\t")
+
+# And add this to the counts
+seqlengths(counts) <- chrom_info[match(seqlevels(counts), chrom_info[, 1]), 2]
+
+get_bins <- function(gff, genome_size, bin) {
+    # Create bins of width "bin", using a genome size table (file)
+    
+    # First, read the genome size and select chromosomes
+    seqnames <- levels(seqnames(gff))
+    g <- read.table(genome_size, sep = "\t")
+    names(g) <- c("chr", "size")
+    g <- g[g$chr %in% seqnames, ]
+    
+    # For each chromosome, create bins
+    start <- unlist(sapply(g$chr, function(x) seq(from=1, by=bin, to=g[g$chr == x, 2])))
+    end <- unlist(sapply(g$chr, function(x) {
+        s <- seq(from=bin, by=bin, to=ceiling(g[g$chr == x, 2]/bin)*bin)
+        s[length(s)] <- g[g$chr == x, 2]
+        s
+    }))
+    
+    # Assert that everything is okay
+    if (length(start) != length(end)) {
+        stop("Oops, something went wrong with the binning")
+    }
+    
+    # Create GRanges
+    bins <- GRanges(seqnames = rep(g$chr, ceiling(g$size / bin)),
+                    ranges = IRanges(start, end))
+    bins <- sortSeqlevels(bins)
+    bins <- sort(bins)
+    bins
+}
+
+get_counts <- function(counts, size) {
+  
+  # Get bins
+  bins <- get_bins(counts, "~/mydata/data/genomes/GRCh38/hg38.chrom.sizes",
+                   size)
+  seqlevels(bins, pruning = "coarse") <- seqlevels(counts)
+  seqinfo(bins) <- seqinfo(counts)
+  
+  # Determine combined counts
+  ovl <- findOverlaps(bins, counts)
+  
+  data.tmp <- as(mcols(counts), "data.frame")
+  tmp <- do.call(rbind,
+                 tapply(subjectHits(ovl),
+                        queryHits(ovl),
+                        function(x) {
+                          if (length(x) == 1) {
+                            data.tmp[x, ]
+                          } else { 
+                            colSums(data.tmp[x, ])
+                          }}))
+  rm(data.tmp)
+  
+  mcols(bins)[, names(mcols(counts))] <- NA
+  mcols(bins)[unique(queryHits(ovl)), ] <- data.frame(tmp)
+  
+  bins
+  
+}
+
+counts_20kb <- get_counts(counts, 20000)
+counts_80kb <- get_counts(counts_20kb, 80000)
+
+```
+
+
+### 2) Normalize
+
+Next, normalize the repliseq data (late over early).
+
+```{r normalize repliseq}
+
+normalize_counts <- function(counts, pseudo = 1, threshold = 1) {
+  
+  # Prepare new object
+  normalized <- counts
+  mcols(normalized) <- NULL
+  
+  # Find matching data
+  data <- as(mcols(counts), "data.frame")
+  late <- grep("late", names(data), value = T)
+  early <- gsub("late", "early", late)
+  
+  # Determine normalized scores
+  normalized_data <- log2((data[, early] + pseudo) / (data[, late] + pseudo))
+  names(normalized_data) <- gsub("_late", "", late)
+  
+  # Bins with <1 reads/M -> NA
+  idx <- data[, late] < threshold & data[, early] < threshold
+  normalized_data[idx] <- NA
+  
+  mcols(normalized) <- normalized_data
+  normalized
+  
+}
+
+combine_replicates <- function(normalized) {
+  
+  # Prepare new object
+  combined <- normalized
+  mcols(combined) <- NULL
+  
+  # Find matching data
+  data <- as(mcols(normalized), "data.frame")
+  
+  cells <- unique(gsub("_.*", "", names(data)))
+  
+  for (cell in cells) {
+    mcols(combined)[, cell] <- rowMeans(data[, grep(cell, names(data))],
+                                        na.rm = F)
+  }
+  
+  combined
+  
+}
+
+# Normalize
+normalized <- normalize_counts(counts)
+normalized_20kb <- normalize_counts(counts_20kb)
+normalized_80kb <- normalize_counts(counts_80kb)
+
+# Combine replicates
+combined <- combine_replicates(normalized)
+combined_20kb <- combine_replicates(normalized_20kb)
+combined_80kb <- combine_replicates(normalized_80kb)
+
+```
+
+
+### 3) Save normalized data as bigwigs
+
+Finally, save the normalized data.
+
+```{r save data}
+
+save_data <- function(normalized, output_dir_bigwig, bin = "5kb") {
+  
+  # Loop over the data
+  for (n in names(mcols(normalized))) {
+    gr <- normalized
+    mcols(gr) <- data.frame(score = mcols(normalized)[, n])
+    gr <- gr[! is.na(gr$score)]
+    export.bw(gr, file.path(output_dir_bigwig,
+                            paste0(n, "_", bin, ".bw")))
+  }
+  
+}
+
+# Prepare output dir
+output_dir_bigwig <- file.path(output_dir, "bigwigs")
+dir.create(output_dir_bigwig, showWarnings = FALSE)
+
+# Save output
+save_data(normalized, output_dir_bigwig, "5kb")
+save_data(normalized_20kb, output_dir_bigwig, "20kb")
+save_data(normalized_80kb, output_dir_bigwig, "80kb")
+
+save_data(combined, output_dir_bigwig, "combined_5kb")
+save_data(combined_20kb, output_dir_bigwig, "combined_20kb")
+save_data(combined_80kb, output_dir_bigwig, "combined_80kb")
+
+```
+
+
+### Conclusion
+
+Looks good.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

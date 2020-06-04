@@ -1,0 +1,784 @@
+---
+title: "Cell cycle sorting - S-phase versus replication timing"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+Looking at the sorted DamID data tracks, I often observed that S-phase sorted
+cells have higher borders / small peaks become stronger. Overall, this seemed
+to occur in these intermediate regions: medium lamina association.
+
+Now, thinking and reading on this, I started looking into transcription during
+S-phase. Of course, a main feature of replication is the replication machinery
+that has to deal with the transcription machinery. What is then the effect of 
+replication on transcription levels? I found a paper that performed nascent
+RNA seqeuencing at various stages of replication. They were able to correlate 
+replication timing with reduced gene expression. Given that LADs are very lowly
+transcribed (which might be the very reason they end up at the lamina), this 
+made me hypothesize that my S-phase observation is directly linked to the 
+replication machinery. Simply put, genes are more lowly expressed when 
+replicating. This leads to an increased lamina association. 
+
+The story I mentioned: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4615114/. 
+
+
+### Method
+
+Look at the difference in signal (compared to S-phase) compared to repliseq
+data. 
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(caTools)))
+
+output_dir <- "ts191216_Sphase_explained_bulkpADamID"
+dir.create(output_dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+LoadRepliseq <- function(cell) {
+  
+  # I want information for every bin. To do so, first get all the bins
+  bins <- read.table("results/counts/bin-20kb/pADamID-Hap1_G1_r1_Dam-20kb.counts.txt.gz",
+                     sep = "\t", col.names = c("seqnames", "start", "end", "score"))
+  bins$start <- bins$start + 1
+  bins <- as(bins, "GRanges")
+  mcols(bins) <- NULL
+  
+  # Now, load the repliseq and add information to the bins
+  # Option 1 - Tom normalization
+  repliseq.file <- paste0("ts190731_4DN_RepliSeq/bigwigs/",
+                          cell,
+                          "_combined_20kb.bw")
+
+  repliseq <- import(repliseq.file)
+  
+  # Option 2 - file from Yuchuan
+  # repliseq.file <- paste0("~/mydata/data/4DNucleome/GRCh38/",
+  #                         cell,
+  #                         "/",
+  #                         cell,
+  #                         "_r1_T_qnorm.bedGraph")
+  # 
+  # r1 <- import(repliseq.file)
+  # r2 <- import(gsub("r1", "r2", repliseq.file))
+  # 
+  # # Combine replicates
+  # ovl <- findOverlaps(r1, r2)
+  # 
+  # repliseq <- r1[queryHits(ovl)]
+  # repliseq$score <- rowMeans(data.frame(r1 = r1$score[queryHits(ovl)],
+  #                                       r2 = r2$score[subjectHits(ovl)]))
+  
+  # Find overlaps and add repliseq
+  ovl <- findOverlaps(bins, repliseq)
+  bins$score <- NA
+  bins$score[queryHits(ovl)] <- repliseq$score[subjectHits(ovl)]
+  
+  # Remove NAs
+  # repliseq <- repliseq[! is.na(repliseq$score)]
+  
+  bins
+  
+}
+
+AddDamID <- function(cell, repliseq) {
+  
+  g1.file <- paste0("~/mydata/proj/tests/results/ts190301_pADamID_CellCycle/results/normalized/bin-20kb/pADamID-", 
+                    cell, 
+                    "_G1_LMNB2-20kb-combined.norm.txt.gz")
+  
+  g1 <- read.table(g1.file, col.names = c("seqnames", "start", "end", "score"))
+  s <- read.table(gsub("G1", "S", g1.file))
+  g2 <- read.table(gsub("G1", "G2", g1.file))
+  
+  # Scale
+  g1[, 4] <- scale(g1[, 4])
+  s[, 4] <- scale(s[, 4])
+  g2[, 4] <- scale(g2[, 4])
+  
+  # Find overlaps
+  g1.ranges <- as(g1, "GRanges")
+  start(g1.ranges) <- start(g1.ranges) + 1
+  ovl <- findOverlaps(repliseq, g1.ranges)
+  
+  repliseq$G1 <- repliseq$S <- repliseq$G2 <- NA
+  repliseq$G1[queryHits(ovl)] <- g1[subjectHits(ovl), 4]
+  repliseq$S[queryHits(ovl)] <- s[subjectHits(ovl), 4]
+  repliseq$G2[queryHits(ovl)] <- g2[subjectHits(ovl), 4]
+  
+  repliseq
+  
+}
+
+AddDamIDCounts <- function(cell, repliseq) {
+  
+  # Get the counts files
+  counts.dir <- "~/mydata/proj/tests/results/ts190301_pADamID_CellCycle/results/counts/bin-20kb/"
+  counts.files <- dir(counts.dir,
+                      pattern = paste0(cell, "_(G1|S|G2)"))
+  counts.names <- paste0("counts_", 
+                         sapply(strsplit(counts.files, "-"), function(x) x[2]))
+  
+  # Get the counts
+  counts.df <- NULL
+  for (counts.file in counts.files) {
+    counts <- read.table(file.path(counts.dir, counts.file), 
+                         col.names = c("seqnames", "start", "end", "score"))
+    # Normalize to 1M reads
+    counts$score <- counts$score / sum(counts$score) * 1e6
+    if (is.null(counts.df)) {
+      counts.df <- counts
+    } else {
+      counts.df <- cbind(counts.df, counts[, 4])
+    }
+  }
+  names(counts.df)[4:ncol(counts.df)] <- counts.names
+  
+  # For simplicity - use the mean of multiple replicates
+  counts.samples <- data.frame(name = counts.names,
+                               phase = sapply(strsplit(counts.names, "_"), function(x) x[3]),
+                               target = sapply(strsplit(counts.names, "_"), function(x) x[5]),
+                               stringsAsFactors = FALSE)
+  
+  counts.samples$phase_target <- paste0(counts.samples$phase, "_", counts.samples$target)
+  counts.samples$phase_target <- factor(counts.samples$phase_target,
+                                        levels = unique(counts.samples$phase_target))
+  
+  tmp <- do.call(cbind, 
+                 tapply(counts.samples$name,
+                        counts.samples$phase_target,
+                        function(x) {
+                          rowMeans(counts.df[, x], na.rm = T)
+                        }))
+  
+  counts.df <- cbind(counts.df[, 1:3],
+                     tmp)
+  counts.names <- levels(counts.samples$phase_target)
+  
+  # Find overlaps
+  counts.ranges <- as(counts.df, "GRanges")
+  start(counts.ranges) <- start(counts.ranges) + 1
+  ovl <- findOverlaps(repliseq, counts.ranges)
+  
+  mcols(repliseq)[, counts.names] <- NA
+  mcols(repliseq)[queryHits(ovl), counts.names] <- counts.df[subjectHits(ovl), counts.names]
+  
+  repliseq
+  
+}
+
+AddDamIDCountsBulk <- function(cell, repliseq) {
+  
+  # Get the counts files
+  counts.dir <- "~/mydata/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/counts/bin-20kb/"
+  counts.files <- dir(counts.dir,
+                      pattern = paste0(cell, "_r._LMNB2"))
+  counts.files <- grep("r5", counts.files, invert = T, value = T)
+  counts.names <- paste0("counts_", 
+                         sapply(strsplit(counts.files, "-"), function(x) x[2]))
+  
+  # Get the counts
+  counts.df <- NULL
+  for (counts.file in counts.files) {
+    counts <- read.table(file.path(counts.dir, counts.file), 
+                         col.names = c("seqnames", "start", "end", "score"))
+    # Normalize to 1M reads
+    counts$score <- counts$score / sum(counts$score) * 1e6
+    if (is.null(counts.df)) {
+      counts.df <- counts
+    } else {
+      counts.df <- cbind(counts.df, counts[, 4])
+    }
+  }
+  names(counts.df)[4:ncol(counts.df)] <- counts.names
+  
+  # For simplicity - use the mean of multiple replicates
+  counts.df <- cbind(counts.df[, 1:3],
+                     rowMeans(counts.df[, 4:ncol(counts.df)]))
+  
+  # Find overlaps
+  counts.ranges <- as(counts.df, "GRanges")
+  start(counts.ranges) <- start(counts.ranges) + 1
+  ovl <- findOverlaps(repliseq, counts.ranges)
+  
+  mcols(repliseq)[, "bulk"] <- NA
+  mcols(repliseq)[queryHits(ovl), "bulk"] <- log2(counts.df[subjectHits(ovl), 4]+1)
+  
+  repliseq
+  
+}
+
+AddDamIDBulk <- function(cell, repliseq) {
+  
+  bulk.file <- paste0("~/mydata/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/normalized/bin-20kb/", 
+                    cell, 
+                    "_LMNB2-20kb-combined.norm.txt.gz")
+  
+  bulk <- read.table(bulk.file, col.names = c("seqnames", "start", "end", "score"))
+  bulk$score <- scale(bulk$score)
+  
+  # Find overlaps
+  bulk.ranges <- as(bulk, "GRanges")
+  start(bulk.ranges) <- start(bulk.ranges) + 1
+  ovl <- findOverlaps(repliseq, bulk.ranges)
+  
+  repliseq$bulk <- NA
+  repliseq$bulk[queryHits(ovl)] <- bulk[subjectHits(ovl), 4]
+  
+  repliseq
+  
+}
+
+PlotRepliseqNorm <- function(cell, repliseq, filter_score = NULL, filter_diff = NULL, idx = NULL) {
+  
+  # Convert to df
+  df <- as(mcols(repliseq), "data.frame")
+  
+  # Calculate difference
+  df.new <- df
+  
+  if (! is.null(filter_diff)) {
+    idx <- which(abs(df.new$G2 - df.new$G1) < filter_diff & complete.cases(df.new))
+  } else {
+    idx <- which(complete.cases(df.new))
+  }
+  
+  df.new <- df.new[idx, ]
+  
+  df.new[, c("G2", "G1")] <- df.new[, "S"] - df.new[, c("G2", "G1")]
+  df.new <- df.new[, c("score", "G1", "G2")]
+  
+  df.new <- melt(df.new, id.vars = "score")
+  
+  # Plot
+  plt <- ggplot(df.new, aes(x = score, y = value)) +
+    geom_bin2d(bins = 100) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+    facet_grid(. ~ variable) +
+    ggtitle(cell) +
+    xlab("repliseq") +
+    ylab("S-phase enrichment") +
+    # coord_cartesian(ylim = c(-2, 2)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  idx
+  
+}
+
+PlotRepliseqNormAgainstBulk <- function(cell, padamid, filter_score = NULL, filter_diff = NULL, 
+                                        idx = NULL, column = "bulk", smooth = FALSE) {
+  
+  # Convert to df
+  df <- as(mcols(padamid), "data.frame")
+  
+  # Potentially: smooth to determine DIFFERENCE only
+  if (smooth) {
+    df.new <- as(mcols(SmoothData(padamid, size = 10e5)), "data.frame")
+  } else {
+    df.new <- df
+  }
+  
+  # Calculate difference
+  if (! is.null(filter_diff)) {
+    idx <- which(abs(df.new$G2 - df.new$G1) < filter_diff & complete.cases(df.new))
+  } else {
+    idx <- which(complete.cases(df.new))
+  }
+  
+  df <- df[idx, ]
+  df.new <- df.new[idx, ]
+  
+  df.new[, c("midS_G2", "midS_G1")] <- df.new[, "S"] - df.new[, c("G2", "G1")]
+  df.new <- cbind(df[, c("score", "G1", "G2", "bulk")], 
+                  df.new[, c("midS_G1", "midS_G2")])
+  
+  df.new <- melt(df.new, id.vars = c("score", "bulk", "G1", "G2"))
+  
+  # Plot
+  plt <- ggplot(df.new, aes_string(x = column, y = "value")) +
+    geom_bin2d(bins = 100) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+    facet_grid(. ~ variable) +
+    ggtitle(cell) +
+    xlab("pA-DamID (z-score)") +
+    ylab("difference pA-DamID (z-score)") +
+    # coord_cartesian(ylim = c(-2, 2)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  
+  df.new$value[df.new$value < -0.4] <- -0.4
+  df.new$value[df.new$value > 0.4] <- 0.4
+  
+  plt <- ggplot(df.new, aes_string(x = "score", y = column, col = "value")) +
+    #geom_bin2d(bins = 100) +
+    #geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+    geom_point(size = 1.2, alpha = 1) +
+    facet_grid(. ~ variable) +
+    ggtitle(cell) +
+    xlab("repliseq") +
+    ylab("pA-DamID (z-score)") +
+    # coord_cartesian(ylim = c(-2, 2)) +
+    scale_color_gradient2() +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  
+  idx
+  
+}
+
+PlotRepliseqCounts <- function(cell, repliseq, filter_score = NULL, filter_diff = NULL, 
+                               pseudo = 1, idx = NULL) {
+  
+  # Convert to df
+  df <- as(mcols(repliseq), "data.frame")
+  
+  if (is.null(idx)) {
+    df.new <- df[complete.cases(df), ]
+  } else {
+    df.new <- df[idx, ]
+  }
+  
+  if (! is.null(filter_score)) {
+    df.new <- df.new[which(rowSums(df.new[, 2:7] > filter_score) > 0), ]
+  } 
+  if (! is.null(filter_diff)) {
+    df.new <- df.new[which(abs(df.new$G2 - df.new$G1) < filter_diff), ]
+  }
+  
+  df.new[, c("G2_Dam", "G1_Dam")] <- - log2((df.new[, c("G2_Dam", "G1_Dam")] + pseudo) / (df.new[, "S_Dam"] + pseudo))
+  df.new[, c("G2_LMNB2", "G1_LMNB2")] <- - log2((df.new[, c("G2_LMNB2", "G1_LMNB2")] + pseudo) / (df.new[, "S_LMNB2"] + pseudo))
+  df.new <- df.new[, c("score", "G1_Dam", "G2_Dam", "G1_LMNB2", "G2_LMNB2")]
+  
+  df.new <- melt(df.new, id.vars = "score")
+  
+  # Set more reasonable limits
+  limits <- quantile(unlist(df.new$value), c(0.001, 0.999)) * 1.5
+  
+  # Plot
+  plt <- ggplot(df.new, aes(x = score, y = value)) +
+    geom_bin2d(bins = 100) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+    facet_grid(. ~ variable) +
+    ggtitle(cell) +
+    xlab("repliseq") +
+    ylab("S-phase enrichment") +
+    coord_cartesian(ylim = limits) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+}
+
+
+SmoothData <- function(data, size = 2e5) {
+  
+  # Convert to df
+  df <- as(mcols(data), "data.frame")
+  
+  # Smooth
+  n_bins <- floor(size / width(data[1]))
+  df.new <- c()
+  
+  for (chr in seqlevels(data)) {
+    idx <- which(as.character(seqnames(data)) == chr)
+    x <- as(mcols(data)[idx, ], "data.frame")
+    x.mean <- data.frame(do.call(cbind,
+                                 lapply(1:ncol(x), function(i) runmean(x[, i], n_bins))))
+    df.new <- rbind(df.new, x.mean)
+  }
+  
+  names(df.new) <- names(df)
+  
+  # Replace the old mcols
+  mcols(data) <- df.new
+
+  # Update: do not smooth repliseq
+  data$score <- df$score
+  
+  data
+  
+}
+
+PlotRepliseqNormBoxplot <- function(cell, repliseq, filter_score = NULL, filter_diff = NULL, idx = NULL) {
+  
+  # Convert to df
+  df <- as(mcols(repliseq), "data.frame")
+  
+  # Calculate difference
+  df.new <- df
+  
+  if (! is.null(filter_diff)) {
+    idx <- which(abs(df.new$G2 - df.new$G1) < filter_diff & complete.cases(df.new))
+  } else {
+    idx <- which(complete.cases(df.new))
+  }
+  
+  df.new <- df.new[idx, ]
+  
+  df.new[, c("G2", "G1")] <- df.new[, "S"] - df.new[, c("G2", "G1")]
+  df.new <- df.new[, c("score", "G1", "G2")]
+  
+  df.new <- melt(df.new, id.vars = "score")
+  
+  # Plot
+  plt <- ggplot(df.new, aes(x = score, y = value)) +
+    geom_bin2d(bins = 100) +
+    geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+    facet_grid(. ~ variable) +
+    ggtitle(cell) +
+    xlab("repliseq") +
+    ylab("S-phase enrichment") +
+    # coord_cartesian(ylim = c(-2, 2)) +
+    scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  idx
+  
+}
+
+# PlotRepliseqNormByPosition <- function(cell, repliseq, feature = "score", 
+#                                        size = 10e6, cutoff = 0,
+#                                          filter_diff = NULL) {
+#   
+#   # Convert to df
+#   df <- as(mcols(repliseq), "data.frame")
+#   
+#   # Calculate megabase (running) average scores
+#   n_bins <- floor(size / width(repliseq[1]))
+#   df$runmean <- NA
+#   
+#   for (chr in seqlevels(repliseq)) {
+#     idx <- which(as.character(seqnames(repliseq)) == chr)
+#     x <- mcols(repliseq)[idx, feature]
+#     x.mean <- runmean(x, n_bins)
+#     df$runmean[idx] <- x.mean
+#   }
+#   
+#   # Use this mean + cutoff to classify the genome into two
+#   df$class <- df$runmean > cutoff
+#   
+#   # Calculate difference
+#   df.new <- df
+#   
+#   # if (! is.null(filter_score)) {
+#   #   df.new <- df.new[which(rowSums(df.new[, 2:4] > filter_score) > 0), ]
+#   # } 
+#   if (! is.null(filter_diff)) {
+#     df.new <- df.new[which(abs(df.new$G2 - df.new$G1) < filter_diff), ]
+#   }
+#   
+#   df.new[, c("G2", "G1")] <- - (df.new[, c("G2", "G1")] - df.new[, "S"])
+#   df.new <- df.new[, c("score", "G1", "G2", "runmean", "class")]
+#   
+#   # Complete cases
+#   df.new <- df.new[complete.cases(df.new), ]
+#   
+#   df.new <- melt(df.new, id.vars = c("score", "runmean", "class"))
+#   
+#   # Plot
+#   plt <- ggplot(df.new, aes(x = score, y = value)) +
+#     geom_bin2d(bins = 100) +
+#     geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+#     facet_grid(class ~ variable) +
+#     ggtitle(cell) +
+#     xlab("repliseq") +
+#     ylab("S-phase enrichment") +
+#     # coord_cartesian(ylim = c(-2, 2)) +
+#     scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+#     theme_bw() +
+#     theme(aspect.ratio = 1)
+#   
+#   plt
+#   
+# }
+# 
+# LoadLADs <- function(cell) {
+#   
+#   # Load LADs
+#   LADs <- import(paste0("results/HMM/bin-20kb/pADamID-",
+#                         cell,
+#                         "_S_LMNB2-20kb-combined_AD.bed.gz"))
+#   
+#   LADs
+#   
+# }
+# 
+# PlotRepliseqNormByLADs <- function(cell, repliseq, LADs, distance = 2e6,
+#                                          filter_diff = NULL) {
+#   
+#   # Convert to df
+#   df <- as(mcols(repliseq), "data.frame")
+#   
+#   # Get distance to nearest LAD
+#   df$distance <- mcols(distanceToNearest(repliseq, LADs))$distance
+#   
+#   # Use this mean + cutoff to classify the genome into two
+#   df$class <- df$distance < distance
+#   
+#   # Calculate difference
+#   df.new <- df
+#   
+#   # if (! is.null(filter_score)) {
+#   #   df.new <- df.new[which(rowSums(df.new[, 2:4] > filter_score) > 0), ]
+#   # } 
+#   if (! is.null(filter_diff)) {
+#     df.new <- df.new[which(abs(df.new$G2 - df.new$G1) < filter_diff), ]
+#   }
+#   
+#   df.new[, c("G2", "G1")] <- - (df.new[, c("G2", "G1")] - df.new[, "S"])
+#   df.new <- df.new[, c("score", "G1", "G2", "class")]
+#   
+#   # Complete cases
+#   df.new <- df.new[complete.cases(df.new), ]
+#   
+#   df.new <- melt(df.new, id.vars = c("score", "class"))
+#   
+#   # Plot
+#   plt <- ggplot(df.new, aes(x = score, y = value)) +
+#     geom_bin2d(bins = 100) +
+#     geom_smooth(method = "loess", span = 0.4, se = FALSE) +
+#     facet_grid(class ~ variable) +
+#     ggtitle(cell) +
+#     xlab("repliseq") +
+#     ylab("S-phase enrichment") +
+#     # coord_cartesian(ylim = c(-2, 2)) +
+#     scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+#     theme_bw() +
+#     theme(aspect.ratio = 1)
+#   
+#   plt
+#   
+# }
+# 
+# PlotRepliseqNormByChromosome <- function(cell, repliseq, cutoffs = c(-3, -1, 1, 3),
+#                                          filter_diff = NULL) {
+#   
+#   # Convert to df
+#   df <- as(mcols(repliseq), "data.frame")
+#   
+#   # Get distance to nearest LAD
+#   df$class <- as.character(seqnames(repliseq))
+#   df$class <- factor(df$class, levels = unique(df$class))
+#   
+#   # Calculate difference
+#   df.new <- df
+#   
+#   # if (! is.null(filter_score)) {
+#   #   df.new <- df.new[which(rowSums(df.new[, 2:4] > filter_score) > 0), ]
+#   # } 
+#   if (! is.null(filter_diff)) {
+#     df.new <- df.new[which(abs(df.new$G2 - df.new$G1) < filter_diff), ]
+#   }
+#   
+#   df.new[, c("G2", "G1")] <- - (df.new[, c("G2", "G1")] - df.new[, "S"])
+#   df.new <- df.new[, c("score", "G1", "G2", "class")]
+#   
+#   # Complete cases
+#   df.new <- df.new[complete.cases(df.new), ]
+#   
+#   # Now, classify in three groups:
+#   early <- df.new[df.new$score > cutoffs[4], ]
+#   middle <- df.new[df.new$score > cutoffs[2] & df.new$score < cutoffs[3], ]
+#   late <- df.new[df.new$score < cutoffs[1], ]
+#   
+#   # Determine mean per chromosome
+#   tmp <- cbind(do.call(rbind,
+#                        tapply(1:nrow(early),
+#                               early$class,
+#                               function(x) colMeans(early[x, c("G1", "G2")]))),
+#                do.call(rbind,
+#                        tapply(1:nrow(late),
+#                               late$class,
+#                               function(x) colMeans(late[x, c("G1", "G2")]))),
+#                do.call(rbind,
+#                        tapply(1:nrow(middle),
+#                               middle$class,
+#                               function(x) colMeans(middle[x, c("G1", "G2")]))))
+#   tmp <- data.frame(tmp)
+#   tmp$seqnames <- unique(df.new$class)
+#   names(tmp)[1:6] <- paste(rep(c("G1", "G2"), 3),
+#                            rep(c("early", "late", "middle"), each = 2),
+#                            sep = "_")
+#   
+#   # Difference in G1 - S for the categories
+#   tmp[, c(1, 3)] <- tmp[, c(1, 3)] - tmp[, 5]
+#   tmp[, c(2, 4)] <- tmp[, c(2, 4)] - tmp[, 6]
+#   
+#   # Get the result
+#   tmp <- tmp[,  c(1:4, 7)]
+#   
+#   tmp <- melt(tmp, id.vars = c("seqnames"))
+#   
+#   # Plot
+#   plt <- ggplot(tmp, aes(x = seqnames, y = value)) +
+#     geom_point() +
+#     # geom_smooth(method = "lm") +
+#     ggtitle(cell) +
+#     xlab("repliseq") +
+#     ylab("S-phase enrichment") +
+#     # coord_cartesian(ylim = c(-2, 2)) +
+#     # scale_fill_gradient(low = "lightgrey", high = "black", name = "Count") +
+#     theme_bw() +
+#     theme(aspect.ratio = 1)
+#   
+#   plt
+#   
+# }
+
+```
+
+### S-phase enrichment versus repliseq
+
+Let's make the plot I mentioned:
+
+```{r s-phase enrichment, fig.width = 7, fig.height = 3.5, warning = FALSE}
+
+# Loop over the two cell lines
+cells <- c("HCT116", "K562")
+
+for (cell in cells) {
+  
+  # Get the repliseq values - 20kb bins
+  repliseq <- LoadRepliseq(cell)
+  
+  # Add DamID data - normalized & counts
+  repliseq.norm <- AddDamID(cell, repliseq)
+  repliseq.counts <- AddDamIDCounts(cell, repliseq)
+  
+  # repliseq.norm_smooth3 <- SmoothData(repliseq.norm, size = 6e5)
+  # repliseq.counts_smooth3 <- SmoothData(repliseq.counts, size = 6e5)
+  repliseq.norm_smooth5 <- SmoothData(repliseq.norm, size = 10e5)
+  repliseq.counts_smooth5 <- SmoothData(repliseq.counts, size = 10e5)
+  # repliseq.norm_smooth7 <- SmoothData(repliseq.norm, size = 14e5)
+  # repliseq.counts_smooth7 <- SmoothData(repliseq.counts, size = 14e5)
+  # repliseq.norm_smooth9 <- SmoothData(repliseq.norm, size = 18e5)
+  # repliseq.counts_smooth9 <- SmoothData(repliseq.counts, size = 18e5)
+  #repliseq <- AddDamIDBulk(cell, repliseq)
+  
+  # Plot S-phase enrichment - normalized & counts
+  # idx <- PlotRepliseqNorm(cell, repliseq.norm, filter_diff = 0.2)
+  # idx3 <- PlotRepliseqNorm(cell, repliseq.norm_smooth3, filter_diff = 0.2)
+  idx5 <- PlotRepliseqNorm(cell, repliseq.norm_smooth5, filter_diff = 0.2)
+  # idx7 <- PlotRepliseqNorm(cell, repliseq.norm_smooth7, filter_diff = 0.2)
+  # idx9 <- PlotRepliseqNorm(cell, repliseq.norm_smooth9, filter_diff = 0.2)
+  
+  # PlotRepliseqCounts(cell, repliseq.counts, idx = idx)
+  # PlotRepliseqCounts(cell, repliseq.counts_smooth3, idx = idx3)
+  PlotRepliseqCounts(cell, repliseq.counts_smooth5, idx = idx5)
+  # PlotRepliseqCounts(cell, repliseq.counts_smooth7, idx = idx7)
+  # PlotRepliseqCounts(cell, repliseq.counts_smooth9, idx = idx9)
+  
+  # Next, I want to show that this is not due to interior lamins binding to 
+  # replication factors. Looking at the data, it seems that regions "more on the
+  # interior" do not show this behaviour. Thus, can I show this in a similar 
+  # plot as above? The main problem though, how do I know which regions are more
+  # interior than others? 
+  # One possible and simple solution is to take the "region" lamina interaction 
+  # as proxy for positioning. What this means: if many nearby regions are at the
+  # lamina, it's quite likely that a particular sequence is at least NEAR the 
+  # lamina. In contrast, regions without sequences at the lamina are more likely
+  # to be positioned more interior.
+  # plot(PlotRepliseqNormByPosition(cell, repliseq.norm, filter_diff = 0.4))
+  
+  # Also, try with LAD distance
+  # LADs <- LoadLADs(cell)
+  # plot(PlotRepliseqNormByLADs(cell, repliseq.norm, LADs, filter_diff = 0.4))
+  
+  # Plot enrichment per chromosome
+  # PlotRepliseqNormByChromosome(cell, repliseq.norm, , filter_diff = 0.4, 
+  #                              cutoffs = c(-1.5, -0.5, 0.5, 1.5))
+  
+  # Load pA-DamID
+  padamid <- AddDamIDBulk(cell, repliseq.norm)
+  tmp <- PlotRepliseqNormAgainstBulk(cell, padamid, filter_diff = 0.2, smooth = T)
+  tmp <- PlotRepliseqNormAgainstBulk(cell, padamid, filter_diff = 0.2, smooth = T, column = "G1")
+  tmp <- PlotRepliseqNormAgainstBulk(cell, padamid, filter_diff = 0.2, smooth = T, column = "G2")
+  
+  padamid <- AddDamIDCountsBulk(cell, repliseq.norm_smooth5)
+  tmp <- PlotRepliseqNormAgainstBulk(cell, padamid, filter_diff = 0.2)
+  
+}
+
+```
+
+### Conclusion
+
+This actually looks really good and fits the hypothesis: replicating DNA is 
+positioned closer to the nuclear lamina. 
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

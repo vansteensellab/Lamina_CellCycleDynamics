@@ -1,0 +1,630 @@
+###############################################################################
+## snakemake config - damid pipeline ##########################################
+###############################################################################
+## Tom van Schaik
+## 171120
+## version 1.3
+
+# Introduction snakemake:
+# Snakemake is a bioinformatics pipeline tool written in python. It follows the 
+# 'make'-logic: you determine rules with which files can be generated, and 
+# which input files these require. Snakemake will try to execute the first rule
+# given, and execute other rules based on the input the final rule requires. 
+# In this way, you have a pipeline. 
+# Some cool features of snakemake:
+# - You give input and output file names, and snakemake will do the rest.
+# - If a rule gives an error, the output file is automatically removed, to 
+#   prevent "partial" data files.
+# - Given a number of cores to snakemake, it will automatically parallelize 
+#   things when possible. 
+# - You can create a fancy workflow overview picture.
+
+# This is the config file for a damid snakemake pipeline, where you list 
+# parameters which will be used in the pipeline.
+
+# Versions:
+# 1.0 - Initial version
+# 1.1 - Updated pipeline
+# 1.2 - Added replicates + changed basename scheme
+# 1.3 - Changed mapping to bwa mem for 4DN compatibility
+
+###############################################################################
+### Parameters and file locations #############################################
+###############################################################################
+
+# Parsing
+read_parser: bin/read_parser/read_parser.py
+read_structure: bin/read_parser/read_structure.txt
+conda_parser: /home/t.v.schaik/mydata/proj/tests/results/ts180813_GCF5083_pADamIDtests/bin/read_parser/conda_parser.yaml
+
+# Mapping
+mapper: bin/mapping/mapping_bwa.sh
+genome_index: /home/t.v.schaik/mydata/data/genomes/GRCh38/ENCODE/GRCh38_rDNA
+conda_mapping: /home/t.v.schaik/mydata/proj/tests/results/ts180813_GCF5083_pADamIDtests/bin/mapping/conda_mapping.yaml
+
+# Counting
+gatc_counting: bin/gatc_counting/gatc_counting.R
+gatc_gff: /home/t.v.schaik/mydata/data/genomes/GRCh38/ENCODE/GRCh38_gatc_fragments.gff
+bins: "5,10,20,25,50,80,100,160,250"
+#bins: "1,2,5,10,20,25,50,80,100,250"
+
+# Normalizing
+normalize_damid: bin/normalization/normalize_damid.R
+normalize_method: dam-log2
+pseudo: 1
+combine_replicates: bin/normalization/combine_replicates.R
+
+# Tracks
+bed2bigwig: bin/data_tracks/bed2BigWig.R
+chrom_sizes: /home/t.v.schaik/mydata/data/genomes/GRCh38/hg38.chrom.sizes
+
+# HMM
+hmm_calling: "bin/HMM_calling/HMM.R"
+
+# File report - the locations should be relative from the snakemake file
+report_relative_location: "./"    # required for previous versions of snakemake
+file_report: "../../bin/reports/experiment_statistics.Rmd"
+replicate_report: "../../bin/reports/replicate_statistics.Rmd"
+centromeres_bed: "bin/reports/ts171110_hg38_centromeres.bed.gz"
+
+# Statistics
+gather_statistics: "bin/statistics/gather_statistics.R"
+merge_statistics: "bin/statistics/merge_statistics.R"
+
+###############################################################################
+### Input and output ##########################################################
+###############################################################################
+
+# Note #1: use spaces instead of tabs for some reason!
+
+# Output directories
+output_dir: "results"
+
+out_parse: parsed
+out_map: mapped
+out_count: counts
+out_norm: normalized
+out_tracks_norm: tracks/normalized
+out_tracks_counts: tracks/counts
+out_hmm: "HMM"
+out_report_experiment: "reports/experiment"
+out_report_replicate: "reports/replicate"
+out_statistics: statistics
+
+
+# Basename target to basename dam-only control list
+basenames:
+  
+  #####################################
+  ### Hap1 ############################
+  #####################################
+  
+  ### Hap1 data:
+  ###   ts180813- Hap1 
+  ###   ts180925- Hap1 new sequencing
+  ###   ts180925- Hap1 shake-off
+  ###   
+  ###
+  
+  # Replicate 1 - with microscopy
+  pADamID-Hap1_r1_Dam:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_1_pAD-conc_neg-Dam_AGTGGTCA_S18_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_12_pAD-conc_neg-Dam_AGTGGTCA_S32_R1_001.fastq.gz
+  pADamID-Hap1_r1_pADam:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_2_pAD-conc_neg-pADam_AACAACCA_S21_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_3_pAD-conc_LMNB1_AACCGAGA_S20_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1-RT:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_4_pAD-conc_LMNB1-RT_AACGCTTA_S24_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1-10m:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_5_pAD-conc_LMNB1-10m_AAGACGGA_S25_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1-BSA:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_6_pAD-conc_LMNB1-BSA_AAGGTACA_S23_R1_001.fastq.gz
+  pADamID-Hap1_r1_H3K27me3:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_7_pAD-conc_H3K27me3_ACACAGAA_S26_R1_001.fastq.gz
+  pADamID-Hap1_r1_H3K9me2:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_8_pAD-conc_H3K9me2_ACAGCAGA_S27_R1_001.fastq.gz
+  pADamID-Hap1_r1_H3K9me3:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_9_pAD-conc_H3K9me3_ACCTCCAA_S28_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1-500d:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_10_pAD-conc_LMNB1-500d_ACGCTCGA_S17_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_1_pADamID-Hap1_r1_LMNB1-500d_ACGCTCGA_S2_R1_001.fastq.gz
+  pADamID-Hap1_r1_LMNB1-500d-pADam-500d:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_11_pAD-conc_LMNB1-500d-pADam-500d_ACGTATCA_S19_R1_001.fastq.gz
+  
+  
+  # Replicate 2 - with microscopy
+  pADamID-Hap1_r2_pADam:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_12_pAD-mouse_neg-pADam_ACTATGCA_S29_R1_001.fastq.gz
+  pADamID-Hap1_r2_2ndrabbit-pADam:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_13_pAD-mouse_neg-2ndrabbit-pADam_AGAGTCAA_S22_R1_001.fastq.gz
+  pADamID-Hap1_r2_LMNB2-no2ndrabbit:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_14_pAD-mouse_LMNB2-no2ndrabbit_AGATCGCA_S30_R1_001.fastq.gz
+  pADamID-Hap1_r2_LMNB2:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_15_pAD-mouse_LMNB2_AGCAGGAA_S31_R1_001.fastq.gz
+  pADamID-Hap1_r2_SC35:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_16_pAD-mouse_SC35_AGTCACTA_S32_R1_001.fastq.gz
+  pADamID-Hap1_r2_CENPA:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_17_pAD-mouse_CENPA_ATCCTGTA_S33_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_13_pAD-mouse_CENPA_ATCCTGTA_S33_R1_001.fastq.gz
+  pADamID-Hap1_r2_NUP153:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_18_pAD-mouse_NUP153_ATTGAGGA_S34_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_14_pAD-mouse_NUP153_ATTGAGGA_S34_R1_001.fastq.gz
+  pADamID-Hap1_r2_LMNB1-rabbit:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts180813_GCF5083_pADamIDtests/5083_19_pAD-mouse_LMNB1-rabbit_CAACCACA_S35_R1_001.fastq.gz
+  
+  
+  # Replicate 3 - with single-cell plates
+  # Note: I swapped "Dam" for "pA-Dam", but didn't realize that the sample 
+  # already had aLMNB1 present. This means the "Dam" sample is 50/50 Dam / LMNB1
+  # Without a new Dam-only control, this sample is discarded in any analyses.
+  pADamID-Hap1_r3_LMNB1:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts181031_GCF5163_pADamID_scTest_bulk/5163_3_pADamID-Hap1_LMNB1_AACAACCA_S209_R1_001.fastq.gz
+  pADamID-Hap1_r3_neg_Dam_bad-Dam:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts181031_GCF5163_pADamID_scTest_bulk/5163_4_pADamID-Hap1_Dam_AAACATCG_S211_R1_001.fastq.gz
+  pADamID-Hap1_r3_H3K27me3:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts181031_GCF5163_pADamID_scTest_bulk/5163_5_pADamID-Hap1_H3K27me3_ACATTGGC_S212_R1_001.fastq.gz
+  pADamID-Hap1_r3_H3K9me3:
+    - /home/t.v.schaik/mydata/proj/tests/data/ts181031_GCF5163_pADamID_scTest_bulk/5163_6_pADamID-Hap1_H3K9me3_ACCACTGT_S213_R1_001.fastq.gz
+  
+  
+  # Replicate 4 - with microscopy
+  # Note: This Dam-only showed "black holes" in the interior, suggesting 
+  # incomplete permeabilization. I will replace this Dam-only.
+  pADamID-Hap1_r4_Dam_semibad-Dam:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_1_pADamID_Hap1_Dam_AGCAGGAA_S2_R1_001.fastq.gz
+  pADamID-Hap1_r4_pADam:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_2_pADamID_Hap1_pA-Dam_AGTCACTA_S3_R1_001.fastq.gz
+  pADamID-Hap1_r4_LMNB1-100:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_3_pADamID_Hap1_LMNB1-100_ATCCTGTA_S4_R1_001.fastq.gz
+  pADamID-Hap1_r4_LMNB1-500:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_4_pADamID_Hap1_LMNB1-500_ATTGAGGA_S5_R1_001.fastq.gz
+  pADamID-Hap1_r4_LMNB2-100:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_5_pADamID_Hap1_LMNB2-100_CAACCACA_S6_R1_001.fastq.gz
+  pADamID-Hap1_r4_LMNB2-500:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_6_pADamID_Hap1_LMNB2-500_CAAGACTA_S7_R1_001.fastq.gz
+  pADamID-Hap1_r4_H3K27me3:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_7_pADamID_Hap1_H3K27me3_CCGTGAGA_S1_R1_001.fastq.gz
+  pADamID-Hap1_r4_H3K9me3:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_8_pADamID_Hap1_H3K9me3_CACTTCGA_S8_R1_001.fastq.gz
+  pADamID-Hap1_r4_NUP153:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_9_pADamID_Hap1_NUP153_CAGCGTTA_S9_R1_001.fastq.gz
+  
+  
+  # Replicate 5
+  pADamID-Hap1_r5_Dam:
+    - /shared/gcf/t.v.schaik/5189/fastq_files/5189_1_pADamID_Hap1_Dam_AAACATCG_S14_R1_001.fastq.gz
+  pADamID-Hap1_r5_pADam:
+    - /shared/gcf/t.v.schaik/5189/fastq_files/5189_2_pADamID_Hap1_pADam_ACATTGGC_S15_R1_001.fastq.gz
+  pADamID-Hap1_r5_LMNB1:
+    - /shared/gcf/t.v.schaik/5189/fastq_files/5189_3_pADamID_Hap1_LMNB1_ACCACTGT_S16_R1_001.fastq.gz
+  pADamID-Hap1_r5_LMNB2:
+    - /shared/gcf/t.v.schaik/5189/fastq_files/5189_4_pADamID_Hap1_LMNB2_AACGTGAT_S17_R1_001.fastq.gz
+    
+    
+  # Replicate 6 - nuclear pores
+  pADamID-Hap1_r6_Dam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_20_pADamID_Hap1-NUPs_Dam_ACGCTCGA_S24_R1_001.fastq.gz
+  pADamID-Hap1_r6_pADam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_21_pADamID_Hap1-NUPs_pA-Dam_ACGTATCA_S18_R1_001.fastq.gz
+  pADamID-Hap1_r6_LMNB2:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_22_pADamID_Hap1-NUPs_LMNB2_ACTATGCA_S25_R1_001.fastq.gz
+  pADamID-Hap1_r6_NUP153:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_23_pADamID_Hap1-NUPs_NUP153_AGAGTCAA_S26_R1_001.fastq.gz
+  pADamID-Hap1_r6_Mab414:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_24_pADamID_Hap1-NUPs_Mab414_AGATCGCA_S27_R1_001.fastq.gz
+  pADamID-Hap1_r6_NUP214:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_25_pADamID_Hap1-NUPs_NUP214_AGCAGGAA_S28_R1_001.fastq.gz
+  pADamID-Hap1_r6_NUP62:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_26_pADamID_Hap1-NUPs_NUP62_AGTCACTA_S29_R1_001.fastq.gz
+  
+    
+  # Replicate 7 - nuclear pores
+  pADamID-Hap1_r7_Dam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_9_pADamID-replicate_HCT116-Dam_AGTACAAG_S17_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_7_pADamID-HCT116_r2_Dam_AGTACAAG_S12_R1_001.fastq.gz
+  pADamID-Hap1_r7_pADam-act:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_10_pADamID-replicate_HCT116-pADam_CATCAAGT_S14_R1_001.fastq.gz
+  pADamID-Hap1_r7_pADam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_11_pADamID-replicate_HCT116-LMNB1_AGTGGTCA_S21_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_8_pADamID-HCT116_r2_LMNB1_AGTGGTCA_S13_R1_001.fastq.gz
+  pADamID-Hap1_r7_LMNB2:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_12_pADamID-replicate_HCT116-LMNB2_AACAACCA_S20_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_9_pADamID-HCT116_r2_LMNB2_AACAACCA_S14_R1_001.fastq.gz
+  pADamID-Hap1_r7_NUP153:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_13_pADamID-replicate_HCT116-NUP153_AACCGAGA_S19_R1_001.fastq.gz
+  pADamID-Hap1_r7_Mab414:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_14_pADamID-replicate_HCT116-Mab414_AACGCTTA_S4_R1_001.fastq.gz
+  pADamID-Hap1_r7_NUP62:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_15_DamID_Hap1-NUPs_Dam_AAGACGGA_S6_R1_001.fastq.gz
+  pADamID-Hap1_r7_NUP214:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_16_DamID_Hap1-NUPs_LMNB1_AAGGTACA_S22_R1_001.fastq.gz
+  
+  
+  # Replicate 8 - additional Dam-only
+  pADamID-Hap1_r8_Dam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_27_pADamID_Hap1-replicate_Dam_ATCCTGTA_S30_R1_001.fastq.gz
+  
+  
+  
+  ### Hap1 DamID nuclear pores:
+  DamID-Hap1_r1_Dam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_7_pADamID-replicate_Hap1-NUP62_ATGCCTAA_S15_R1_001.fastq.gz
+  DamID-Hap1_r1_LMNB1:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_8_pADamID-replicate_Hap1-NUP214_CTGTAGCC_S16_R1_001.fastq.gz
+  DamID-Hap1_r1_NUP93:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_17_DamID_Hap1-NUPs_NUP93_ACACAGAA_S9_R1_001.fastq.gz
+  DamID-Hap1_r1_NUP153:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_18_DamID_Hap1-NUPs_NUP153_ACAGCAGA_S23_R1_001.fastq.gz
+  DamID-Hap1_r1_NUP153-Nterm:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_19_DamID_Hap1-NUPs_NUP153-Nterm_ACCTCCAA_S13_R1_001.fastq.gz
+  
+  
+  
+  #####################################
+  ### pA-DamID shake-off ##############
+  #####################################
+  
+  # Replicate 1
+  pAD-shakeoff_LMNB1_0h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_1_LMNB1_0h_AAACATCG_S87_R1_001.fastq.gz
+  pAD-shakeoff_LMNB1_1h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_2_LMNB1_1h_ACATTGGC_S90_R1_001.fastq.gz
+  pAD-shakeoff_LMNB1_2h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_3_LMNB1_2h_ACCACTGT_S89_R1_001.fastq.gz
+  pAD-shakeoff_LMNB1_2h45:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_4_LMNB1_2h45_AACGTGAT_S93_R1_001.fastq.gz
+  pAD-shakeoff_LMNB1_wt:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_5_LMNB1_wt_CGCTGATC_S94_R1_001.fastq.gz
+  pAD-shakeoff_Dam_0h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_6_Dam_0h_CAGATCTG_S92_R1_001.fastq.gz
+  pAD-shakeoff_Dam_1h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_7_Dam_1h_ATGCCTAA_S95_R1_001.fastq.gz
+  pAD-shakeoff_Dam_2h:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_8_Dam_2h_CTGTAGCC_S96_R1_001.fastq.gz
+  pAD-shakeoff_Dam_2h45:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_9_Dam_2h45_AGTACAAG_S86_R1_001.fastq.gz
+  pAD-shakeoff_Dam_wt:
+    - /shared/gcf/d.peric/5104/fastq_files/5104_10_Dam_wt_CATCAAGT_S88_R1_001.fastq.gz
+  
+  
+  
+  #####################################
+  ### K562 ############################
+  #####################################
+  
+  ### K562 data:
+  ###   ts180925- K562 experiment
+  ###   
+
+  # Replicate 1
+  pADamID-K562_r1_Dam:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_1_pADamID-K562_neg_Dam_ACAAGCTA_S22_R1_001.fastq.gz
+  pADamID-K562_r1_pADam:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_2_pADamID-K562_neg_pADam_AAACATCG_S25_R1_001.fastq.gz
+  pADamID-K562_r1_LMNB1:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_3_pADamID-K562_LMNB1_ACATTGGC_S24_R1_001.fastq.gz
+  pADamID-K562_r1_LMNB2:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_4_pADamID-K562_LMNB2_ACCACTGT_S26_R1_001.fastq.gz
+  pADamID-K562_r1_CENPA:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_5_pADamID-K562_CENPA_AACGTGAT_S27_R1_001.fastq.gz
+  pADamID-K562_r1_NCL:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_6_pADamID-K562_NCL_CGCTGATC_S28_R1_001.fastq.gz
+  pADamID-K562_r1_NPMI:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_7_pADamID-K562_NPMI_CAGATCTG_S29_R1_001.fastq.gz
+  pADamID-K562_r1_NUP153:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_8_pADamID-K562_NUP153_ATGCCTAA_S21_R1_001.fastq.gz
+  pADamID-K562_r1_SC35:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_9_pADamID-K562_SC35_CTGTAGCC_S23_R1_001.fastq.gz
+  pADamID-K562_r1_SON:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_10_pADamID-K562_SON_AGTACAAG_S30_R1_001.fastq.gz
+  pADamID-K562_r1_H3K27me3:
+    - /shared/gcf/t.v.schaik/5105/fastq_files/5105_11_pADamID-K562_H3K27me3_CATCAAGT_S31_R1_001.fastq.gz
+  
+  
+  # Replicate 2
+  pADamID-K562_r2_Dam:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_1_pADamID_K562_Dam_CGCTGATC_S26_R1_001.fastq.gz
+  pADamID-K562_r2_pADam:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_2_pADamID_K562_pADam_CAGATCTG_S27_R1_001.fastq.gz
+  pADamID-K562_r2_LMNB1:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_3_pADamID_K562_LMNB1_ATGCCTAA_S28_R1_001.fastq.gz
+  pADamID-K562_r2_LMNB2:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_4_pADamID_K562_LMNB2_CTGTAGCC_S29_R1_001.fastq.gz
+  pADamID-K562_r2_NPMI:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_5_pADamID_K562_NPMI_AGTACAAG_S30_R1_001.fastq.gz
+  pADamID-K562_r2_NUP153:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_6_pADamID_K562_NUP153_CATCAAGT_S31_R1_001.fastq.gz
+    
+  
+  # Replicate 3
+  pADamID-K562_r3_Dam:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_10_pADamID_K562_Dam_CATACCAA_S10_R1_001.fastq.gz
+  pADamID-K562_r3_H3K27me3:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_11_pADamID_K562_H3K27me3_CCAGTTCA_S11_R1_001.fastq.gz
+  pADamID-K562_r3_H3K9me3:
+    - /shared/gcf/t.v.schaik/5188/fastq_files/5188_12_pADamID_K562_H3K9me3_CCGAAGTA_S12_R1_001.fastq.gz
+
+
+
+
+  #####################################
+  ### HCT116 ##########################
+  #####################################
+  
+  ### HCT116 data:
+  ###   
+  
+  # Replicate 1
+  pADamID-HCT116_r1_Dam:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_7_pADamID_HCT116_Dam_AGTGGTCA_S25_R1_001.fastq.gz
+  pADamID-HCT116_r1_pADam:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_8_pADamID_HCT116_pADam_AACAACCA_S32_R1_001.fastq.gz
+  pADamID-HCT116_r1_LMNB1:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_9_pADamID_HCT116_LMNB1_AACCGAGA_S33_R1_001.fastq.gz
+  pADamID-HCT116_r1_LMNB2:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_10_pADamID_HCT116_LMNB2_AACGCTTA_S34_R1_001.fastq.gz
+  pADamID-HCT116_r1_NPMI:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_11_pADamID_HCT116_NPMI_AAGACGGA_S35_R1_001.fastq.gz
+  pADamID-HCT116_r1_NUP153:
+    - /shared/gcf/t.v.schaik/5190/fastq_files/5190_12_pADamID_HCT116_NUP153_AAGGTACA_S36_R1_001.fastq.gz
+  
+  
+  # Replicate 2
+  pADamID-HCT116_r2_Dam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_1_pADamID-replicate_Hap1-Dam_AAACATCG_S5_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_4_pADamID-Hap1_r2_Dam_AAACATCG_S8_R1_001.fastq.gz
+    #- /shared/gcf/t.v.schaik/5576/fastq_files/5576_7_pADamID-HCT116_r2_Dam_AGTACAAG_S12_R1_001.fastq.gz
+  pADamID-HCT116_r2_pADam:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_2_pADamID-replicate_Hap1-pADam-act_ACATTGGC_S8_R1_001.fastq.gz
+  pADamID-HCT116_r2_LMNB1:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_3_pADamID-replicate_Hap1-pADam_ACCACTGT_S7_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_5_pADamID-Hap1_r2_LMNB1_ACCACTGT_S9_R1_001.fastq.gz
+    #- /shared/gcf/t.v.schaik/5576/fastq_files/5576_8_pADamID-HCT116_r2_LMNB1_AGTGGTCA_S13_R1_001.fastq.gz
+  pADamID-HCT116_r2_LMNB2:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_4_pADamID-replicate_Hap1-LMNB2_AACGTGAT_S11_R1_001.fastq.gz
+    - /shared/gcf/t.v.schaik/5576/fastq_files/5576_6_pADamID-Hap1_r2_LMNB2_AACGTGAT_S7_R1_001.fastq.gz
+    #- /shared/gcf/t.v.schaik/5576/fastq_files/5576_9_pADamID-HCT116_r2_LMNB2_AACAACCA_S14_R1_001.fastq.gz
+  pADamID-HCT116_r2_NUP153:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_5_pADamID-replicate_Hap1-NUP153_CGCTGATC_S12_R1_001.fastq.gz
+  pADamID-HCT116_r2_Mab414:
+    - /shared/gcf/t.v.schaik/5264/fastq_files/5264_6_pADamID-replicate_Hap1-Mab414_CAGATCTG_S10_R1_001.fastq.gz
+  
+  
+  # Also, add the data from the synchronization experiments
+  # Replicate 3
+  pADamID-HCT116_r3_Dam:
+    - /shared/gcf/t.v.schaik/5469/fastq/5469_1_pA-DamID_G1G2C_HCT116_Control_Dam_R1_AGATCGCA_S2_R1_001.fastq.gz
+  pADamID-HCT116_r3_LMNB2:
+    - /shared/gcf/t.v.schaik/5469/fastq/5469_2_pA-DamID_G1G2C_HCT116_Control_LMNB2_R1_AGCAGGAA_S5_R1_001.fastq.gz
+  
+  # Replicate 4
+  pADamID-HCT116_r4_Dam:
+    - /shared/gcf/t.v.schaik/5520/fastq_files/5520_4_pA-DamID_G1G2C_HCT116_Control_Dam_R3_GAATCTGA_S51_R1_001.fastq.gz
+  pADamID-HCT116_r4_LMNB2:
+    - /shared/gcf/t.v.schaik/5520/fastq_files/5520_5_pA-DamID_G1G2C_HCT116_Control_LMNB2_R3_GACTAGTA_S52_R1_001.fastq.gz
+  
+  
+  # Replicate 5 - nucleolus testing with pA-DamID on HCT116 cells
+  pADamID-HCT116_r5_pADam:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_13_pADamID_HCT116_pADam_CCGAAGTA_S59_R1_001.fastq.gz
+  pADamID-HCT116_r5_Dam:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_14_pADamID_HCT116_Dam_CCGTGAGA_S67_R1_001.fastq.gz
+  pADamID-HCT116_r5_LMNB2:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_15_pADamID_HCT116_LMNB2_CCTCCTGA_S68_R1_001.fastq.gz
+  pADamID-HCT116_r5_NCL:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_16_pADamID_HCT116_NCL_CGAACTTA_S69_R1_001.fastq.gz
+  pADamID-HCT116_r5_NPMI:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_17_pADamID_HCT116_NPMI_CGACTGGA_S70_R1_001.fastq.gz
+  pADamID-HCT116_r5_PolR1E:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_18_pADamID_HCT116_PolR1E_CGCATACA_S71_R1_001.fastq.gz
+  pADamID-HCT116_r5_MKI67IP:
+    - /shared/gcf/t.v.schaik/5740/fastq_files/5740_19_pADamID_HCT116_MKI67IP_CTCAATGA_S72_R1_001.fastq.gz
+  
+  
+# Bam control list, using basenames only
+dam_controls:
+  
+  # 1) Using conc NEB Dam as Dam-only
+  
+  # Hap1
+  pADamID-Hap1_r1_pADam: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1-RT: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1-10m: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1-BSA: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_H3K27me3: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_H3K9me2: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_H3K9me3: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1-500d: pADamID-Hap1_r1_Dam
+  pADamID-Hap1_r1_LMNB1-500d-pADam-500d: pADamID-Hap1_r1_Dam
+  
+  # Note, I don't really have a good Dam-only for replicate 2 - is that bad?
+  # Update: I generated an additional Dam-only for this replicate, even though 
+  # that's also not ideal. 
+  pADamID-Hap1_r2_pADam: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_2ndrabbit-pADam: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_LMNB2-no2ndrabbit: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_LMNB2: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_SC35: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_CENPA: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_NUP153: pADamID-Hap1_r8_Dam
+  pADamID-Hap1_r2_LMNB1-rabbit: pADamID-Hap1_r8_Dam
+  
+  pADamID-Hap1_r3_LMNB1: pADamID-Hap1_r3_neg_Dam_bad-Dam
+  pADamID-Hap1_r3_H3K27me3: pADamID-Hap1_r3_neg_Dam_bad-Dam
+  pADamID-Hap1_r3_H3K9me3: pADamID-Hap1_r3_neg_Dam_bad-Dam
+  
+  pADamID-Hap1_r4_pADam: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_LMNB1-100: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_LMNB1-500: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_LMNB2-100: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_LMNB2-500: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_H3K27me3: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_H3K9me3: pADamID-Hap1_r4_Dam_semibad-Dam
+  pADamID-Hap1_r4_NUP153: pADamID-Hap1_r4_Dam_semibad-Dam
+  
+  pADamID-Hap1_r5_pADam: pADamID-Hap1_r5_Dam
+  pADamID-Hap1_r5_LMNB1: pADamID-Hap1_r5_Dam
+  pADamID-Hap1_r5_LMNB2: pADamID-Hap1_r5_Dam
+  
+  pADamID-Hap1_r6_pADam: pADamID-Hap1_r6_Dam
+  pADamID-Hap1_r6_LMNB2: pADamID-Hap1_r6_Dam
+  pADamID-Hap1_r6_NUP153: pADamID-Hap1_r6_Dam
+  pADamID-Hap1_r6_Mab414: pADamID-Hap1_r6_Dam
+  pADamID-Hap1_r6_NUP214: pADamID-Hap1_r6_Dam
+  pADamID-Hap1_r6_NUP62: pADamID-Hap1_r6_Dam
+  
+  pADamID-Hap1_r7_pADam-act: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_pADam: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_LMNB2: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_NUP153: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_Mab414: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_NUP62: pADamID-Hap1_r7_Dam
+  pADamID-Hap1_r7_NUP214: pADamID-Hap1_r7_Dam
+  
+  # Hap1 DamID nuclear pores
+  DamID-Hap1_r1_LMNB1: DamID-Hap1_r1_Dam
+  DamID-Hap1_r1_NUP93: DamID-Hap1_r1_Dam
+  DamID-Hap1_r1_NUP153: DamID-Hap1_r1_Dam
+  DamID-Hap1_r1_NUP153-Nterm: DamID-Hap1_r1_Dam
+  
+
+  # Hap1 - shakeoff
+  pAD-shakeoff_LMNB1_0h: pAD-shakeoff_Dam_0h
+  pAD-shakeoff_LMNB1_1h: pAD-shakeoff_Dam_1h
+  pAD-shakeoff_LMNB1_2h: pAD-shakeoff_Dam_2h
+  pAD-shakeoff_LMNB1_2h45: pAD-shakeoff_Dam_2h45
+  pAD-shakeoff_LMNB1_wt: pAD-shakeoff_Dam_wt
+  
+  
+  # K562
+  pADamID-K562_r1_pADam: pADamID-K562_r1_Dam
+  pADamID-K562_r1_LMNB1: pADamID-K562_r1_Dam
+  pADamID-K562_r1_LMNB2: pADamID-K562_r1_Dam
+  pADamID-K562_r1_CENPA: pADamID-K562_r1_Dam
+  pADamID-K562_r1_NCL: pADamID-K562_r1_Dam
+  pADamID-K562_r1_NPMI: pADamID-K562_r1_Dam
+  pADamID-K562_r1_NUP153: pADamID-K562_r1_Dam
+  pADamID-K562_r1_SC35: pADamID-K562_r1_Dam
+  pADamID-K562_r1_SON: pADamID-K562_r1_Dam
+  pADamID-K562_r1_H3K27me3: pADamID-K562_r1_Dam
+  
+  pADamID-K562_r2_pADam: pADamID-K562_r2_Dam
+  pADamID-K562_r2_LMNB1: pADamID-K562_r2_Dam
+  pADamID-K562_r2_LMNB2: pADamID-K562_r2_Dam
+  pADamID-K562_r2_NPMI: pADamID-K562_r2_Dam
+  pADamID-K562_r2_NUP153: pADamID-K562_r2_Dam
+  
+  pADamID-K562_r3_H3K27me3: pADamID-K562_r3_Dam
+  pADamID-K562_r3_H3K9me3: pADamID-K562_r3_Dam
+  
+  
+  # HCT116
+  pADamID-HCT116_r1_pADam: pADamID-HCT116_r1_Dam
+  pADamID-HCT116_r1_LMNB1: pADamID-HCT116_r1_Dam
+  pADamID-HCT116_r1_LMNB2: pADamID-HCT116_r1_Dam
+  pADamID-HCT116_r1_NPMI: pADamID-HCT116_r1_Dam
+  pADamID-HCT116_r1_NUP153: pADamID-HCT116_r1_Dam
+  
+  pADamID-HCT116_r2_pADam: pADamID-HCT116_r2_Dam
+  pADamID-HCT116_r2_LMNB1: pADamID-HCT116_r2_Dam
+  pADamID-HCT116_r2_LMNB2: pADamID-HCT116_r2_Dam
+  pADamID-HCT116_r2_NUP153: pADamID-HCT116_r2_Dam
+  pADamID-HCT116_r2_Mab414: pADamID-HCT116_r2_Dam
+  
+  pADamID-HCT116_r3_LMNB2: pADamID-HCT116_r3_Dam
+  
+  pADamID-HCT116_r4_LMNB2: pADamID-HCT116_r4_Dam
+  
+  pADamID-HCT116_r5_pADam: pADamID-HCT116_r5_Dam
+  pADamID-HCT116_r5_LMNB2: pADamID-HCT116_r5_Dam
+  pADamID-HCT116_r5_NCL: pADamID-HCT116_r5_Dam
+  pADamID-HCT116_r5_NPMI: pADamID-HCT116_r5_Dam
+  pADamID-HCT116_r5_PolR1E: pADamID-HCT116_r5_Dam
+  pADamID-HCT116_r5_MKI67IP: pADamID-HCT116_r5_Dam
+  
+  
+  
+  
+
+# Replicate experiments
+replicates:
+  
+  # Hap1
+  Hap1_pADam:
+    - pADamID-Hap1_r1_pADam
+    - pADamID-Hap1_r2_pADam
+    - pADamID-Hap1_r4_pADam
+    - pADamID-Hap1_r5_pADam
+    - pADamID-Hap1_r6_pADam
+    - pADamID-Hap1_r7_pADam
+  Hap1_LMNB1:
+    - pADamID-Hap1_r1_LMNB1-500d
+    - pADamID-Hap1_r4_LMNB1-500
+    - pADamID-Hap1_r5_LMNB1
+  Hap1_LMNB2:
+    - pADamID-Hap1_r2_LMNB2 # Leave out?
+    - pADamID-Hap1_r4_LMNB2-100
+    - pADamID-Hap1_r5_LMNB2
+    - pADamID-Hap1_r6_LMNB2
+    - pADamID-Hap1_r7_LMNB2
+  Hap1_H3K27me3:
+    - pADamID-Hap1_r1_H3K27me3
+    - pADamID-Hap1_r4_H3K27me3
+  Hap1_H3K9me3:
+    - pADamID-Hap1_r1_H3K9me3
+    - pADamID-Hap1_r4_H3K9me3
+  Hap1_NUP153:
+    - pADamID-Hap1_r2_NUP153
+    - pADamID-Hap1_r4_NUP153
+    - pADamID-Hap1_r6_NUP153
+    - pADamID-Hap1_r7_NUP153
+  Hap1_Mab414:
+    - pADamID-Hap1_r6_Mab414
+    - pADamID-Hap1_r7_Mab414
+  Hap1_NUP62:
+    - pADamID-Hap1_r6_NUP62
+    - pADamID-Hap1_r7_NUP62
+  Hap1_NUP214:
+    - pADamID-Hap1_r6_NUP214
+    - pADamID-Hap1_r7_NUP214
+  
+  
+  # K562
+  K562_pADam:
+    - pADamID-K562_r1_pADam
+    - pADamID-K562_r2_pADam
+  K562_LMNB1:
+    - pADamID-K562_r1_LMNB1
+    - pADamID-K562_r2_LMNB1
+  K562_LMNB2:
+    - pADamID-K562_r1_LMNB2
+    - pADamID-K562_r2_LMNB2
+  K562_H3K27me3:
+    - pADamID-K562_r1_H3K27me3
+    - pADamID-K562_r3_H3K27me3
+  K562_NUP153:
+    - pADamID-K562_r1_NUP153
+    - pADamID-K562_r2_NUP153
+  K562_NPMI:
+    - pADamID-K562_r1_NPMI
+    - pADamID-K562_r2_NPMI
+  
+  
+  # HCT116
+  HCT116_pADam:
+    - pADamID-HCT116_r1_pADam
+    - pADamID-HCT116_r2_pADam
+  HCT116_LMNB1:
+    - pADamID-HCT116_r1_LMNB1
+    - pADamID-HCT116_r2_LMNB1
+  HCT116_LMNB2:
+    - pADamID-HCT116_r1_LMNB2
+    - pADamID-HCT116_r2_LMNB2
+    - pADamID-HCT116_r3_LMNB2
+    - pADamID-HCT116_r4_LMNB2
+  HCT116_NUP153:
+    - pADamID-HCT116_r1_NUP153
+    - pADamID-HCT116_r2_NUP153
+  

@@ -1,0 +1,1081 @@
+---
+title: "Cell cycle sorting - differential LADs - Hap1"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+Differential LADs between G1 and G2 sorted cells, with 20kb normalized (& 
+scaled) bins.
+
+
+### Method
+
+Using the modified voom trick to shrink variation and limma for the analysis.
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(ggbeeswarm)))
+suppressMessages(suppressWarnings(library(limma)))
+suppressMessages(suppressWarnings(library(edgeR)))
+suppressMessages(suppressWarnings(library(RColorBrewer)))
+
+cell <- "Hap1"
+
+
+# 
+# Prepare output
+output_dir <- paste0("ts190708_differential_analysis_BinsandLADs_", cell)
+dir.create(output_dir, showWarnings = FALSE)
+
+# Parameter to extend bins to a certain distance (bases) for a more accurate 
+# lamina interaction score
+ext <- 0
+
+# Get the samples data frame prepared
+input_dir <- "results/counts/bin-20kb/"
+hmm_dir <- "results/HMM/bin-20kb/"
+samples <- grep("bulk",
+                grep(cell, dir(input_dir), value = T),
+                value = T, invert = T)
+samples.lmnb2 <- grep("LMNB2", samples, value = T)
+
+samples.count <- length(samples.lmnb2)
+
+# Also put this into a data frame
+samples.df <- data.frame(sample = samples.lmnb2,
+                         name = gsub("_LMNB2.*", "",
+                                     gsub("pADamID-", "", samples.lmnb2)),
+                         cell = cell,
+                         stringsAsFactors = FALSE)
+
+# Finally, I want to manually set the factor levels for (in my opinion) the 
+# best order.
+samples.df$cell <- factor(samples.df$cell, levels = unique(samples.df$cell))
+
+samples.df$phase <- sapply(samples.df$name, function(x) strsplit(x, "_")[[1]][2])
+samples.df$phase <- factor(samples.df$phase, levels = c("G1", "S", "G2"))
+
+samples.df$replicate <- sapply(samples.df$name, function(x) strsplit(x, "_")[[1]][3])
+samples.df$replicate <- factor(samples.df$replicate, levels = unique(samples.df$replicate))
+
+samples.df$target <- "LMNB2"
+samples.df$target <- factor(samples.df$target, levels = unique(samples.df$target))
+
+n <- nrow(samples.df)
+
+samples.df.file <- file.path(output_dir, "samples_df.rds")
+saveRDS(samples.df, samples.df.file)
+
+# Read chromosome sizes
+chrom_sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes")
+names(chrom_sizes) <- c("seqnames", "length")
+row.names(chrom_sizes) <- chrom_sizes$seqnames
+
+# Prepare output files
+df.count.file <- file.path(output_dir, "df_count.rds")
+LADs.file <- file.path(output_dir, "LADs.rds")
+LADs.counts.file <- file.path(output_dir, "LADs_counts.rds")
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+# Define LADs
+GetHMMRegion <- function(hmm, target, centromeres, n = NULL, min.size = 1e5) {
+  
+  # Simple function to retrieve hmm regions with:
+  # * More than "n" tracks have this called
+  #   If is.null(n) -> more than 50% of the data
+  # * Split over centromeres
+  # * Bigger than min.size (to prevent a single element from taking over)
+  
+  # Get the samples
+  samples.cell <- grep(target, names(mcols(hmm)), value = T)
+  
+  hmm.cell <- hmm
+  mcols(hmm.cell) <- mcols(hmm)[, samples.cell]
+  
+  # Reduce ranges - present in at least "n" samples
+  if (is.null(n)) {
+    n <- floor(length(samples.cell) / 2) + 1
+  }
+  
+  regions <- GenomicRanges::reduce(hmm.cell[rowSums(as(mcols(hmm.cell), "data.frame") == "LAD", na.rm = T) >= n])
+  
+  # Filter for centromeres
+  if (! is.null(centromeres)) {
+    regions <- setdiff(regions, centromeres)
+  }
+  
+  # Filter for minimum size
+  regions <- regions[width(regions) > min.size]
+  
+  regions
+}
+
+# Normalize Lamina over Dam (ratio2)
+NormalizeDamID <- function(df, pseudo = 1) {
+  # This function expects a data frame that is composed of lamina and Dam-only
+  # columns, in that order. It simply determines the log2 ratio of the two for
+  # every pair of columns. A pseudocount is added to prevent problems.
+  
+  n <- ncol(df)
+  
+  df.norm <- log2((df[, seq(1, n-1, 2)] + pseudo) / (df[, seq(2, n, 2)] + pseudo))
+  df.norm
+  
+}
+
+# Voom variation modeling
+voom_damid <- function(counts, values, design = NULL, span = 0.7, lib.size = NULL,
+                       normalize.method = "none", plot = TRUE) {
+  # Function to fit the variance for the various features, modified for DamID
+  # Try 1: fit the variance versus the region width
+  
+  # Prepare the output list
+  out <- list()
+  
+  # Input: GRanges with counts
+  # Currently: combined (raw) Dam + lamina counts
+  counts <- as(mcols(counts), "data.frame")
+  values <- as(mcols(values), "data.frame")
+  
+  # Prepare design matrix
+  n <- nrow(counts)
+  if (n < 2L) 
+    stop("Need at least two bins to fit a mean-variance trend")
+  if (is.null(design)) {
+    design <- matrix(1, ncol(counts), 1)
+    rownames(design) <- colnames(counts)
+    colnames(design) <- "GrandMean"
+  }
+  
+  if (is.null(lib.size)) 
+    lib.size <- colSums(counts)
+  
+  # Prepare log2-like cpm values from the original counts
+  y <- t(log2(t(counts + 0.5)/(lib.size + 1) * 1e+06))
+  y <- normalizeBetweenArrays(y, method = normalize.method)
+  
+  # Fit the models
+  # 1) First, I need to estimate the standard deviation from the actual 
+  #    measurements
+  fit <- lmFit(values, design)
+  sy <- sqrt(fit$sigma)
+  
+  # 2) I also need the "estimated count" to later calculate the predicted count
+  fit <- lmFit(y, design)
+  Amean <- rowMeans(y, na.rm = TRUE)
+  
+  # And get the fitted values
+  sx <- Amean + mean(log2(lib.size + 1)) - log2(1e+06)
+  # sy <- sqrt(fit$sigma)
+  allzero <- rowSums(counts) == 0
+  if (any(allzero)) {
+    sx <- sx[!allzero]
+    sy <- sy[!allzero]
+  }
+  
+  # Model the curve
+  l <- lowess(sx, sy, f = span)
+  
+  # Get the approximated values from the curve
+  f <- approxfun(l, rule = 2)
+  if (fit$rank < ncol(design)) {
+    j <- fit$pivot[1:fit$rank]
+    fitted.values <- fit$coef[, j, drop = FALSE] %*% t(fit$design[, 
+                                                                  j, drop = FALSE])
+  } else {
+    fitted.values <- fit$coef %*% t(fit$design)
+  }
+  
+  # Plot the curve
+  if (plot) {
+    plot(sx, sy, xlab = "log2( count size + 0.5 )", ylab = "Sqrt( standard deviation )", 
+         pch = 16, cex = 0.25)
+    title("voom: Mean-variance trend")
+    lines(l, col = "red")
+    # Also add the residual sum of squares
+    legend("topright", paste0("RSS: ", round(sum((f(sx)-sy)^2), 2)), bty="n") 
+  }
+  
+  # Repeat log2 calculation of the fitted counts, again using library size 
+  # normalization
+  fitted.cpm <- 2^fitted.values
+  fitted.count <- 1e-06 * t(t(fitted.cpm) * (lib.size + 1))
+  fitted.logcount <- log2(fitted.count)
+  
+  # Get the inverse squared predicted standard deviation
+  w <- 1/f(fitted.logcount)^4
+  dim(w) <- dim(fitted.logcount)
+  
+  
+  out$E <- values
+  out$y <- y
+  out$weights <- w
+  out$design <- design
+  out$sx <- sx
+  out$sy <- sy
+  if (is.null(out$targets)) {
+    out$targets <- data.frame(lib.size = lib.size)
+  } else { 
+    out$targets$lib.size <- lib.size
+  }
+  
+  new("EList", out)
+    
+}
+
+```
+
+### 1) Load read counts
+
+First, I will create a GRanges object with all the GATC counts. With option 
+"cache" to prevent having to do this every time.
+
+```{r load counts}
+
+# 1) Read count data frame
+df.count <- NULL
+
+for (s in samples.lmnb2) {
+    
+  # Create the file path of the sample
+  df.name <- file.path(input_dir,
+                       s)
+  
+  # Read the data
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end", s))
+  names(df)[4] <- s
+  
+  # Also read the Dam-only!
+  dam <- read.table(gsub("LMNB2", "Dam", df.name),
+                    sep = "\t", stringsAsFactors = FALSE,
+                    col.names = c("seqnames", "start", "end", s))[, 4]
+  df[, paste0(s, "_Dam")] <- dam
+  
+  # Add this to one data frame
+  if (is.null(df.count)) {
+    df.count <- df
+  } else {
+    df.count <- cbind(df.count, df[, 4:5], stringsAsFactors = F)
+    # names(df.norm)[ncol(df.count)] = s
+  }
+}
+
+# Add +1 to the start, as this was bed-based
+df.count[, 2] <- df.count[, 2] + 1
+df.count <- as(df.count, "GRanges")
+
+# Set seqlevels
+seqlevels(df.count, pruning = "coarse") <- c(paste0("chr", 1:22), "chrX")
+seqlengths(df.count) <- chrom_sizes[seqlevels(df.count), "length"]
+
+saveRDS(df.count, df.count.file)
+
+```
+
+
+### 2) Define LADs
+
+```{r load centromeres}
+
+# Read centromeres
+centromeres <- read.table("bin/reports/ts171110_hg38_centromeres.bed.gz")
+
+# Select useful information
+centromeres <- centromeres[, c(2:4)]
+names(centromeres) <- c("seqnames", "start", "end")
+
+# Convert to GRanges
+centromeres <- as(centromeres, "GRanges")
+
+# Filter for seqlevels
+chromosomes.used <- c(paste0("chr", 1:22), "chrX")
+seqlevels(centromeres, pruning.mode = "coarse") <- chromosomes.used
+
+# Make one consensus centromere per chromosome
+start <- sapply(seqlevels(centromeres), 
+                function(chr) min(start(centromeres[seqnames(centromeres) == chr])))
+end <- sapply(seqlevels(centromeres), 
+              function(chr) max(end(centromeres[seqnames(centromeres) == chr])))
+centromeres <- GRanges(seqnames = seqlevels(centromeres),
+                       ranges = IRanges(start = start, end = end))
+
+export.bed(centromeres, file.path(output_dir, "centromeres.bed"))
+
+```
+
+```{r define LADs}
+
+# I want to perform this analysis for bins & LADs. This means that I have to 
+# define the LADs. I will use the previously implemented approach, but using the
+# bed files. This means using the bed files to determine LAD / iLAD. Afterwards,
+# merging them, split over centromeres and filter for too low counts.
+df.hmm <- df.count
+mcols(df.hmm) <- NULL
+
+for (i in 1:nrow(samples.df)) {
+  
+  # Convert count file "s" into LAD file
+  s <- gsub(".counts.txt.gz", "_AD.bed.gz", samples.df$sample[i])
+  
+  # Create the file path of the sample
+  df.name <- file.path(hmm_dir,
+                       s)
+  
+  # Read the data
+  df <- read.table(df.name,
+                   sep = "\t", stringsAsFactors = FALSE,
+                   col.names = c("seqnames", "start", "end"))
+  ovl <- ifelse(overlapsAny(df.hmm, as(df, "GRanges")), "LAD", "iLAD")
+
+  # Add this to one data frame
+  mcols(df.hmm) <- cbind(mcols(df.hmm), ovl)
+}
+
+names(mcols(df.hmm)) <- samples.df$name
+
+# Define LADs - present in more than 50% of the samples
+LADs_G1 <- GetHMMRegion(df.hmm, "G1", centromeres = centromeres)
+LADs_S <- GetHMMRegion(df.hmm, "S", centromeres = centromeres)
+LADs_G2 <- GetHMMRegion(df.hmm, "G2", centromeres = centromeres)
+
+# Combine cell-phase LADs into one consensus set
+LADs <- union(LADs_G1, LADs_G2)
+
+```
+
+
+### 3) Count reads in LADs
+
+Next, get the combined count for every bin and LAD.
+
+```{r counts in bins and LADs}
+
+# Overlap LADs with the counts
+ovl <- findOverlaps(LADs, df.count)
+
+# Get the summed signal for every bin
+LADs.counts <- LADs
+mcols(LADs.counts) <- NULL
+mcols(LADs.counts)[, names(mcols(df.count))] <- NA
+
+mcols(LADs.counts[unique(queryHits(ovl))]) <- 
+  do.call(rbind, 
+          tapply(subjectHits(ovl),
+                 queryHits(ovl),
+                 function(x) colSums(as(mcols(df.count), "data.frame")[x, ]),
+                 simplify = TRUE))
+
+# Filter LADs for having too few reads?
+idx <- rowSums(as(mcols(LADs.counts), "data.frame") > 5) > 1
+
+LADs <- LADs[idx]
+LADs.counts <- LADs.counts[idx]
+
+saveRDS(LADs, LADs.file)
+saveRDS(LADs.counts, LADs.counts.file)
+
+export.bed(LADs, file.path(output_dir, "LADs.bed"))
+
+```
+
+This looks good, but I don't want to do this every time. Load in the results.
+
+```{r read RDS}
+
+df.count <- readRDS(df.count.file)
+LADs <- readRDS(LADs.file)
+LADs.counts <- readRDS(LADs.counts.file)
+
+```
+
+
+### 4) Normalize bins
+
+Next, we would like to normalize the counts for various parameters:
+
+  * Library size
+  * Lamina / Dam ratio
+  * More?
+  
+Absolute read filtering
+
+```{r absolute read filtering}
+
+# To-do: filter bins for having too few bins?
+#        alternatively, filter for number of GATC fragments overlapping a bin?
+bins <- bins.counts <- df.count
+mcols(bins) <- NULL
+
+idx <- rowSums(as(mcols(bins.counts), "data.frame") > 5) > 1
+
+bins <- bins[idx]
+bins.counts <- bins.counts[idx]
+
+```
+
+The library size.
+
+```{r library size}
+
+# Calculate the library size
+library_size <- colSums(as(mcols(df.count), "data.frame"))
+library_size
+
+# Also combined the counts (Dam + lamina) and have them separate
+bins.counts.combined <- bins.counts.lamina <- bins.counts.dam <- bins.counts
+mcols(bins.counts.combined) <- (as(mcols(bins.counts)[, seq(1, 2*n, 2)], "data.frame") + 
+                                   as(mcols(bins.counts)[, seq(2, 2*n, 2)], "data.frame"))
+mcols(bins.counts.lamina) <- mcols(bins.counts)[, seq(1, 2*n, 2)]
+mcols(bins.counts.dam) <- mcols(bins.counts)[, seq(2, 2*n, 2)]
+
+# Normalize to 1M reads
+norm_factor <- library_size / 1e6
+bins.counts.norm <- bins.counts
+mcols(bins.counts.norm) <- t(t(as(mcols(bins.counts), "data.frame")) / norm_factor)
+
+# Also create a 1M mean counts of Dam and lamina per experiment
+bins.counts.norm.combined <- bins.counts.norm
+mcols(bins.counts.norm.combined) <- (as(mcols(bins.counts.norm)[, seq(1, 2*n, 2)], "data.frame") + 
+                                        as(mcols(bins.counts.norm)[, seq(2, 2*n, 2)], "data.frame")) / 2
+
+
+
+# Also, normalized LADs
+# Normalize to 1M reads
+LADs.counts.norm <- LADs.counts
+mcols(LADs.counts.norm) <- t(t(as(mcols(LADs.counts), "data.frame")) / norm_factor)
+
+
+```
+
+Lamina over Dam ratio (log2).
+
+```{r Dam ratio}
+
+# Normalize Lamina over Dam (ratio2)
+bins.norm <- bins.counts
+mcols(bins.norm) <- NormalizeDamID(as(mcols(bins.counts.norm), "data.frame"))
+
+names(mcols(bins.norm)) <- samples.df$name
+
+```
+
+With the basic normalization done, let's make some quick plots.
+
+  * Sample distribution
+  * Correlations
+  
+```{r plot distributions, fig.width = 4.5, fig.height = 4}
+
+# Plot the distributions for the various samples
+plot(1, 1, type = "n", xlim = c(-5, 5), ylim = c(0, 0.3),
+     xlab = "Dam-ratio (log2)", ylab = "density", main = "Density Dam ratio for bins")
+
+for (i in 1:n) {
+  lines(density(mcols(bins.norm)[, i]), 
+        col = as.numeric(samples.df$phase)[i], lwd = 2,
+        lty = as.numeric(samples.df$replicate)[i])
+}
+
+legend("topright", legend = levels(samples.df$phase), pch = 19, 
+       col = 1:length(levels(samples.df$phase)))
+
+```
+
+We make the assumption that the distributions are the same between time points, 
+and thus scale the data. 
+
+```{r scaling of the data, fig.width = 4.5, fig.height = 4}
+
+bins.norm.scaled <- bins.norm
+mcols(bins.norm.scaled) <- scale(as(mcols(bins.norm.scaled), "data.frame"))
+
+# Plot the distributions for the various samples after scaling
+plot(1, 1, type = "n", xlim = c(-3, 3), ylim = c(0, 0.5),
+     xlab = "Dam-ratio (log2)", ylab = "density", main = "Density Dam ratio for bins")
+
+for (i in 1:n) {
+  lines(density(mcols(bins.norm.scaled)[, i]), 
+        col = as.numeric(samples.df$phase)[i], lwd = 2,
+        lty = as.numeric(samples.df$replicate)[i])
+}
+
+legend("topright", legend = levels(samples.df$phase), pch = 19, 
+       col = 1:length(levels(samples.df$phase)))
+
+```
+
+[Note how the distributions are not necessarily identical.]
+
+
+### 5) Define LAD scores
+
+LAD scores are a bit different. I made the assumption that overall the binned 
+distribution does not change. In other words, every condition has the same 
+amount of lamina and therefore the same total DNA that can sit there. LADs are
+basically combined bins that form domains. They can correspond to a few bins,
+but also to dozens of them. As they are not corresponding to constant genomic
+sizes, you cannot easily scale them or anything. Instead, I decided to define 
+the LAD score as the mean of the corresponding normalized & scaled bins.
+
+```{r calculate LAD scores}
+
+# Get the lamina counts
+LADs.counts.lamina <- LADs.counts
+mcols(LADs.counts.lamina) <- mcols(LADs.counts)[, seq(1, 2*n, 2)]
+
+# Duplicate LADs for normalized scores
+LADs.norm <- LADs
+
+ovl <- findOverlaps(LADs.norm, bins.norm.scaled)
+
+# Calculate the mean score per region and add this as column
+mcols(LADs.norm) <- do.call(rbind, tapply(subjectHits(ovl),
+                                          queryHits(ovl),
+                                          function(x) colMeans(as(mcols(bins.norm.scaled), "data.frame")[x, ],
+                                                               na.rm = T),
+                                          simplify = TRUE))
+
+saveRDS(LADs.norm, file.path(output_dir, "LADs_norm.rds"))
+
+```
+
+
+### 6) Voom modeling
+
+With the normalized bin counts, I can start thinking about differential 
+expression analysis. (This does require replications, ideally, but I don't have
+those yet.) However, as you can see in the correlations above, the variance is
+not equal everywhere. Let's list some factors that strongly influence variation
+in the normalized scores.
+
+  * bin length / number of (mappable) GATC fragments. bin length means more
+    data points and thus better estimated variance.
+  * Accessibility. Accessibility means more reads per data point and thus better
+    estimated variance.
+  * Lamina association. Lamina associated DNA is usually compact (not 
+    accessible), but at the same time you have more target reads. This most 
+    likely means a better estimated variance.
+    
+This means that I have to make a decision which factor to use to estimate the 
+variance curve. Easiest is probably the total number of reads (Dam + Dam-lamin).
+
+```{r variance modeling, fig.width = 4.5, fig.height = 4}
+
+# Model variance for each bin, based on various parameters
+design <- model.matrix(~ 0 + samples.df$phase + samples.df$replicate)
+
+# # 1) Combined (normalized) counts
+# bins.voom <- voom_damid(bins.counts.norm.combined, bins.norm.scaled)
+# 
+# # 2) Lamina counts
+# bins.voom <- voom_damid(bins.counts.lamina, bins.norm.scaled)
+# 
+# # 3) Dam counts
+# bins.voom <- voom_damid(bins.counts.dam, bins.norm.scaled)
+# 
+# # 4) Combined counts
+# bins.voom <- voom_damid(bins.counts.combined, bins.norm.scaled)
+# 
+# # 5) Lamina counts - with design
+# bins.voom <- voom_damid(bins.counts.lamina, bins.norm.scaled, design = NULL)
+# 
+# # 6) Lamina scores - with design
+# tmp <- bins.norm.scaled
+# mcols(tmp) <- 2^as(mcols(bins.norm.scaled), "data.frame")
+# LADs.voom <- voom_damid(tmp, bins.norm.scaled, design = NULL)
+# 
+# 
+# 1b) LADs - lamina counts
+LADs.voom <- voom_damid(LADs.counts.lamina, LADs.norm, design = NULL)
+
+# 2b) LADs - lamina scores
+tmp <- LADs.norm
+mcols(tmp) <- 2^as(mcols(LADs.norm), "data.frame")
+LADs.voom <- voom_damid(tmp, LADs.norm, design = NULL)
+
+
+```
+
+Based on these plots, the best fit (lowest residual sum of squares) uses the
+total lamina reads as proxy for stability. This is probably because the few
+"reliable" measures are in contact with the lamina and therefore have a high
+lamina score.
+
+For now, I will indeed continue with the lamina counts.
+
+```{r variance modeling part 2}
+
+# Lamina counts
+# bins.voom <- voom_damid(bins.counts.lamina, bins.norm.scaled, 
+#                         design = NULL, plot = FALSE)
+LADs.voom <- voom_damid(LADs.counts.lamina, LADs.norm, design = NULL,
+                        plot = F)
+
+```
+
+Note: another thing to consider is the design matrix used in the variance 
+modeling. For now, I did not use a design matrix, which means that all 
+measurements are used for the standard deviation. In case of a supplied 
+matrix, the modeling will be done taking that into account.
+
+
+### 7) Differential LADs with limma
+
+Let's continue with the differential bin calling using limma and the voom
+modelled variance weights.
+
+```{r limma LADs}
+
+# Make experimental desigin
+design <- model.matrix(~ 0 + samples.df$phase)
+colnames(design) <- levels(samples.df$phase)
+
+# Run limma using a two-state model
+fit <- lmFit(LADs.voom, design)
+cont.matrix <- makeContrasts(G2 - G1, levels = design)
+fit <- contrasts.fit(fit, cont.matrix)
+fit <- eBayes(fit)
+topTable(fit)
+
+# Alternatively, run limma using splines
+# Good in theory, but I don't understand it properly yet
+# Let's use one with 1 df (basic linear model)
+# library(splines)
+# X <- ns(as.numeric(samples.df$phase), df = 1)
+# # Then fit separate curves for the control and treatment groups:
+# design <- model.matrix(~ X)
+# fit <- lmFit(LADs.voom, design)
+# fit <- eBayes(fit)
+# topTable(fit)
+
+# Get the results
+results <- decideTests(fit, adjust.method = "BH", p.value = 0.01, method = "global")
+
+saveRDS(fit, file.path(output_dir, "LADs_fit.rds"))
+saveRDS(results, file.path(output_dir, "LADs_results.rds"))
+
+results <- results[, 1]
+
+```
+
+Unfortunately, nothing is significant now. Let's set the thresholds a bit lower
+to get some bins; we expect better statistics with actual replicates.
+
+```{r get results LADs}
+
+# Get the indices
+idx <- which(results != 0)
+idx.up <- which(results > 0)
+idx.down <- which(results < 0)
+
+# And return the values
+cat("Given, p-value = 0.05")
+cat("   bins up:", length(idx.up))
+cat("   bins down:", length(idx.down))
+
+# Save .bed files
+export.bed(LADs[idx.up], file.path(output_dir, "LADs_up.bed"))
+export.bed(LADs[idx.down], file.path(output_dir, "LADs_down.bed"))
+
+```
+
+
+#### Visualize results
+
+Now, I will try to visualize the results in a useful plot. 
+
+```{r visualize results LADs, fig.width = 5, fig.height = 3.5}
+
+# limma MA-plot
+# plotMD(fit, status = results)
+df <- data.frame(x = fit$Amean,
+                 y = fit$coefficients[, 1],
+                 result = factor(results, levels = c("0", "-1", "1")))
+
+ggplot(df, aes(x = x, y = y, col = result)) + 
+  geom_point(alpha = 1) +
+  ggtitle(paste0("MAplot - ", cell)) +
+  xlab("log2 mean") +
+  ylab("log2 difference") +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                     labels = paste0(c("-", "down", "up"),
+                                     " (n=",
+                                     as.vector(table(df$result)),
+                                     ")")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+
+### 8) Save results
+
+For later comparisons, I will save the results.
+
+```{r save results}
+
+# Save files as RDS
+saveRDS(bins, file.path(output_dir, "bins_filtered.rds"))
+saveRDS(bins.norm, file.path(output_dir, "bins_norm.rds"))
+saveRDS(fit, file.path(output_dir, "bins_limma.rds"))
+saveRDS(results, file.path(output_dir, "results_limma.rds"))
+
+```
+
+
+### 9) How does this compare with cLADs?
+
+Looking at the data, it seems that the regions that lose the lamina interactions
+are depleted in cLADs. Can I verify this?
+
+
+```{r cLADs, fig.width = 5, fig.height = 3.5}
+
+cLADs <- readRDS("/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180130_laminaVsNucleolus/ts180131_differential_localization/DamID_cLADs.rds")
+
+ovl <- overlapsAny(cLADs, LADs)
+ovl.up <- overlapsAny(cLADs, LADs[idx.up])
+ovl.down <- overlapsAny(cLADs, LADs[idx.down])
+
+df <- data.frame(class = c("cAD", "ciAD", "fAD"),
+                 all = as.vector(table(cLADs$calls[ovl])),
+                 up = as.vector(table(cLADs$calls[ovl.up])),
+                 down = as.vector(table(cLADs$calls[ovl.down])))
+df.melt <- melt(df, id.vars = "class")
+
+# Absolute scores
+ggplot(df.melt, aes(x = variable, y = value / 50, fill = class)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  ggtitle("LAD types") +
+  xlab("LAD score") +
+  ylab("Size (Mb)") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+# Fractions
+df[, 2:4] <- t(t(df[, 2:4]) / colSums(df[, 2:4]))
+df.melt <- melt(df, id.vars = "class")
+
+ggplot(df.melt, aes(x = variable, y = value, fill = class)) + 
+  geom_bar(stat = "identity") +
+  ggtitle("LAD types") +
+  xlab("LAD score") +
+  ylab("Percentage") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+Yes. Not a very extreme enrichment though.
+
+
+### 10) Where are the differential regions on the chromosome?
+
+Looking at the data, it seems that the regions that lose the lamina interactions
+are mostly located at the ends of chromosomes. Can I verify this?
+
+```{r chromosomal positioning - telomeres, fig.width = 5, fig.height = 3.5}
+
+# Define telomeres
+telomeres <- GRanges(seqnames = rep(seqlevels(LADs), times = 2),
+                     ranges = IRanges(start = c(rep(1, length(seqlevels(LADs))),
+                                                seqlengths(LADs)),
+                                      end = c(rep(1, length(seqlevels(LADs))),
+                                              seqlengths(LADs))))
+
+# Distance to telomeres data frame
+LADs$distance_to_telomeres <- mcols(distanceToNearest(LADs, telomeres))$distance
+
+df <- data.frame(class = factor("-", levels = c("-", "down", "up")),
+                 distance_to_telomeres = LADs$distance_to_telomeres)
+df$class[idx.down] <- "down"
+df$class[idx.up] <- "up"
+
+# Plot
+ggplot(df, aes(x = class, y = distance_to_telomeres / 1e6, col = class)) +
+  geom_quasirandom(width = 0.5) +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+  ggtitle("LAD differences near telomeres") +
+  xlab("LAD class") +
+  ylab("Distance to telomeres (Mb)") +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                     labels = paste0(c("-", "down", "up"),
+                                     " (n=",
+                                     as.vector(table(df$class)),
+                                     ")")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+```{r chromosomal positioning - centromeres, fig.width = 5, fig.height = 3.5}
+
+# Distance to telomeres data frame
+LADs$distance_to_centromeres <- mcols(distanceToNearest(LADs, centromeres))$distance
+
+df$distance_to_centromeres = LADs$distance_to_centromeres
+
+# Plot
+ggplot(df, aes(x = class, y = distance_to_centromeres / 1e6, col = class)) +
+  geom_quasirandom(width = 0.5) +
+  geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+  ggtitle("LAD differences near centromeres") +
+  xlab("LAD class") +
+  ylab("Distance to centromeres (Mb)") +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                     labels = paste0(c("-", "down", "up"),
+                                     " (n=",
+                                     as.vector(table(df$class)),
+                                     ")")) +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+```
+
+Yes, definitely. Why? Some outliers though. Again, why?
+
+Telomeres form a disc in G2: https://doi.org/10.1002/cyto.a.20159 
+
+
+### 11) Unnormalized scores
+
+I want to highlight that these differential genes are not simply Dam-only 
+related. To do so, I will here plot the library size-normalized values for
+lamina and Dam-only.
+
+```{r unnormalized scores, fig.width = 8, fig.height = 3.5}
+
+# Get the library size normalized values
+df <- as(mcols(LADs.counts.norm), "data.frame")
+
+df.names <- expand.grid(c("_LMNB2", "_Dam"), samples.df$phase)
+names(df) <- paste0(df.names$Var2, df.names$Var1)
+
+# Add result
+df$result <- "-"
+df$result[results == 1] <- "up"
+df$result[results == -1] <- "down"
+df$result <- factor(df$result, levels = c("down", "-", "up"))
+
+# Plot
+df.new <- data.frame(result = df$result,
+                     Dam = log2((rowMeans(df[, grep("G2_Dam", names(df))],
+                                    na.rm = T) + 1) / 
+                       (rowMeans(df[, grep("G1_Dam", names(df))],
+                                na.rm = T) + 1)),
+                     LMNB2 = log2((rowMeans(df[, grep("G2_LMNB2", names(df))],
+                                    na.rm = T) + 1) / 
+                       (rowMeans(df[, grep("G1_LMNB2", names(df))],
+                                na.rm = T) + 1)))
+                     
+df.new <- melt(df.new, id.vars = "result")
+
+ggplot(df.new, aes(x = result, y = value, fill = variable)) +
+  # geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, col = "black", width = 0.7, position = "dodge") +
+  ggtitle("Target ratios") +
+  xlab("target") +
+  ylab("ratio G2/G1 (log2)") +
+  scale_fill_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+
+df <- melt(df, id.vars = "result")
+df$phase <- factor(gsub("_(D|L).*", "", df$variable),
+                   levels = levels(samples.df$phase))
+df$type <- factor(gsub(".*_", "", df$variable))
+
+ggplot(df, aes(x = phase, y = log2(value + 1), col = phase, fill = type)) +
+  # geom_quasirandom() +
+  geom_boxplot(outlier.shape = NA, col = "black", width = 0.7, position = "dodge") +
+  ggtitle("Unnormalized scores") +
+  xlab("timepoint") +
+  ylab("log2(CPM + 1)") +
+  facet_grid(. ~ result) +
+  scale_fill_brewer(palette = "Set1") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+
+```
+
+### 12) Differences within one LAD
+
+Bas asked me to show that LADs are generally decreasing as a whole. To show 
+this, I will create a figure that shows the difference in G2 - G1 for every bin
+within in a LAD, scaled from 0 to 1 (as LAD borders).
+
+```{r scores within a LAD, fig.width = 6, fig.height = 3}
+
+library(caTools)
+
+# To create the figure, I should get all the values overlapping LADs and scale
+# their "distance" from 0 to 1. For simplicity and because of relatively low 
+# LAD numbers, let's loop over them.
+
+# First, create bins with mean score per class
+bins.norm.scaled.mean <- bins.norm.scaled
+mcols(bins.norm.scaled.mean) <- do.call(cbind,
+                                        tapply(samples.df$name,
+                                               samples.df$phase,
+                                               function(x) rowMeans(as(mcols(bins.norm.scaled), "data.frame")[, x],
+                                                                    na.rm = T)))
+
+# Initially output data frame
+df <- c()
+
+# Overlap LADs and bins
+ovl <- findOverlaps(LADs, bins)
+
+# Loop over LADs
+for (i in 1:length(LADs)) {
+  
+  # Get LAD and bins
+  LAD.i <- LADs[i]
+  bins.i <- bins.norm.scaled.mean[subjectHits(ovl)[queryHits(ovl) == i]]
+  
+  # Create a new data frame of bin values, with distance normalized
+  # Distance: first bin=0 and last bin=1
+  df.i <- data.frame(position = (start(bins.i) - start(LAD.i)) / (width(LAD.i) - width(bins.i)[1]),
+                     diff = bins.i$G2 - bins.i$G1,
+                     LAD = i,
+                     class = results[i])
+  df.i <- cbind(df.i,
+                as(mcols(bins.i), "data.frame"))
+  
+  # Let's only take reasonably sized LADs: 15 bins
+  # if (length(bins.i) <= 15) {
+  #   next
+  # }
+  
+  df.i$diff.smooth <- runmean(df.i$diff, 
+                              k = 9, endrule = "mean")
+  
+  # Add to final df
+  df <- rbind(df, df.i)
+  
+}
+
+# Plot diff for every LAD
+plt <- ggplot(df, aes(x = position, y = diff.smooth, group = LAD, col = factor(class))) +
+  geom_line(alpha = 0.5) +
+  geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+  xlab("LAD position") +
+  ylab("Difference G2 - G1") +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(1, 9, 3)],
+                     name = "Class") +
+  theme_bw()
+
+plot(plt)
+
+# Boxplots for every LAD, sorted by median difference
+LAD.diff <- tapply(df$diff, df$LAD, mean)
+idx <- order(LAD.diff)
+df$LAD <- factor(df$LAD, levels = as.character(idx))
+
+ggplot(df, aes(x = LAD, y = diff, fill = factor(class))) + 
+  geom_boxplot(col = NA, outlier.shape = NA, coef = 0) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(1, 9, 3)],
+                    name = "Class",
+                    labels = c("down", "stable", "up")) +
+  xlab("LAD") +
+  ylab("Difference G2 - G1") +
+  coord_cartesian(ylim = c(-1.3, 1.3)) +
+  theme_classic() +
+  theme(aspect.ratio = 1, 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+ggplot(df, aes(x = LAD, y = diff)) + 
+  geom_boxplot(col = NA, outlier.shape = NA, coef = 0, fill = "grey") +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  xlab("LAD") +
+  ylab("Difference G2 - G1") +
+  coord_cartesian(ylim = c(-1.3, 1.3)) +
+  theme_classic() +
+  theme(aspect.ratio = 1, 
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+
+```
+
+
+
+### Conclusion
+
+This seems like a statistically sound method to call differential bins. I think
+the procedure will be much cleaner with replicates. 
+
+Next: these differential bins in pA-DamID, do they also show a difference in 
+the old DamID? (Remember: the pA-DamID does not show differences of the old 
+differential bins.)
+
+
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

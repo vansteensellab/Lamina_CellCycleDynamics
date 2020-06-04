@@ -1,0 +1,400 @@
+---
+title: "Differential LADs and Hi-C subcompartments & CTCF peaks"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Introduction
+
+Reviewer #3 asked how the differential LADs compare with Hi-C subcompartments.
+I don't think this is necessary to include, but let's do it anyway.
+
+For this, I need differential LADs and Hi-C subcompartments. I will use the
+subcompartments as imputed by SNIPER (Kyle, Ma lab).
+
+ts200326: update, also do this for CTCF peaks.
+
+
+### Method
+
+Simply overlap of the genome.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up, message = F}
+
+# Load dependencies
+library(tidyverse)
+library(ggplot2)
+library(GenomicRanges)
+library(rtracklayer)
+library(RColorBrewer)
+library(limma)
+
+# # Prepare output 
+output.dir <- "ts200318_hic_subcompartments"
+dir.create(output.dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, dev=c('png', 'pdf'), 
+               fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+CalculateOverlap <- function(LADs, compartments, cell) {
+  
+  # Convert to factor
+  compartments$name <- factor(compartments$name)
+  
+  # Intersect
+  compartments.down <- compartments[compartments %over% LADs[LADs$diff == -1]]
+  table.down <- table(compartments.down$name)
+  
+  compartments.stable <- compartments[compartments %over% LADs[LADs$diff == 0]]
+  table.stable <- table(compartments.stable$name)
+  
+  compartments.up <- compartments[compartments %over% LADs[LADs$diff == 1]]
+  table.up <- table(compartments.up$name)
+  
+  # Combine into tibble
+  tib <- tibble(subcompartment = factor(c("A1", "A2", "B1", "B2", "B3")),
+                down = as.vector(table.down),
+                stable = as.vector(table.stable),
+                up = as.vector(table.up)) %>%
+    gather(key, value, -subcompartment) %>%
+    mutate(key = factor(key, levels = c("down", "stable", "up"))) %>% 
+    group_by(key) %>% 
+    mutate(perc = value / sum(value)) %>%
+    ungroup() %>%
+    add_column(cell = cell)
+  
+  tib
+  
+}
+
+PlotFractions <- function(ovl, main = "", combined = F) {
+  
+  plt.base <- ovl %>%
+    ggplot(aes(x = key, fill = subcompartment)) +
+    xlab("") +
+    ggtitle(main) +
+    scale_fill_manual(values = c("darkgreen", "lightgreen",
+                                 "red", "yellow", "darkgrey")) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  if (combined) {
+    plt.base <- plt.base +
+      facet_grid(. ~ cell) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1),
+            aspect.ratio = 3)
+  }
+  
+  # Counts
+  plt <- plt.base +
+    geom_bar(aes(y = value), stat = "identity") +
+    ylab("# 100kb bins")
+  
+  plot(plt)
+  
+  # Percentages
+  plt <- plt.base +
+    geom_bar(aes(y = perc), stat = "identity") +
+    ylab("Fraction")
+  
+  plot(plt)
+    
+}
+
+CalculateOverlapInverted <- function(LADs, compartments) {
+  
+  # Convert to factor
+  compartments$name <- factor(compartments$name)
+  
+  # Intersect
+  ovl <- findOverlaps(compartments, LADs, type = "any", select = "arbitrary")
+  
+  compartments$lad <- LADs$diff[ovl]
+  
+  # Change into words
+  compartments$lad[is.na(compartments$lad)] <- "non-LAD"
+  compartments$lad[compartments$lad == -1] <- "down"
+  compartments$lad[compartments$lad == 0] <- "stable"
+  compartments$lad[compartments$lad == 1] <- "up"
+  
+  compartments$lad <- factor(compartments$lad, levels = c("down", "stable",
+                                                          "up", "non-LAD"))
+  
+  # Table
+  tib <- as_tibble(mcols(compartments)) %>%
+    dplyr::select(name, lad) %>%
+    group_by(name, lad) %>%
+    dplyr::summarise(value = n()) %>%
+    group_by(name) %>%
+    mutate(perc = value / sum(value)) %>%
+    ungroup()
+  
+  tib
+  
+}
+
+PlotFractionsInverted <- function(ovl, main = "") {
+  
+  plt.base <- ovl %>%
+    ggplot(aes(x = name, fill = lad)) +
+    xlab("") +
+    ggtitle(main) +
+    scale_fill_manual(values = c(brewer.pal(9, "Set1")[c(1, 9, 3)],
+                                 "snow2")) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  # Counts
+  plt <- plt.base +
+    geom_bar(aes(y = value), stat = "identity") +
+    ylab("# 100kb bins")
+  
+  plot(plt)
+  
+  # Percentages
+  plt <- plt.base +
+    geom_bar(aes(y = perc), stat = "identity") +
+    ylab("Fraction")
+  
+  plot(plt)
+    
+}
+
+```
+
+
+### 1. Read data
+
+First the subcompartments. Downloaded from the article.
+
+```{r hic subcompartments}
+
+# Read SNIPER output
+compartment.hap1 <- import("ts200318_hic_subcompartments/HAP1_track_hg38.bed.gz")
+compartment.k562 <- import("ts200318_hic_subcompartments/K562_track_hg38.bed.gz")
+
+```
+
+Next, the differential LADs.
+
+```{r read LADs}
+
+# Read differential LADs
+lads.hap1 <- import("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_Hap1/LADs.bed")
+lads.results.hap1 <- readRDS("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_Hap1/LADs_results.rds")
+
+lads.hap1$diff <- lads.results.hap1[, 1]
+
+lads.k562 <- import("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_K562/LADs.bed")
+lads.results.k562 <- readRDS("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_K562/LADs_results.rds")
+
+lads.k562$diff <- lads.results.k562[, 1]
+
+lads.hct116 <- import("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_HCT116/LADs.bed")
+lads.results.hct116 <- readRDS("../ts190301_pADamID_CellCycle/ts190708_differential_analysis_BinsandLADs_HCT116/LADs_results.rds")
+
+lads.hct116$diff <- lads.results.hct116[, 1]
+
+```
+
+
+### 2. Overlap between LADs and subcompartments
+
+With the LADs and compartments, I can compute the overlap.
+
+```{r calculate overlap}
+
+ovl.hap1 <- CalculateOverlap(lads.hap1, compartment.hap1, cell = "HAP-1")
+ovl.k562 <- CalculateOverlap(lads.k562, compartment.k562, cell = "K562")
+
+```
+
+
+### 3. Plot
+
+Plot.
+
+```{r plot, fig.width = 5, fig.height = 3.5}
+
+# Various plots
+PlotFractions(ovl.hap1, main = "HAP-1")
+PlotFractions(ovl.k562, main = "K562")
+
+```
+
+
+```{r combined plot, fig.width = 8, fig.height = 3.5}
+
+# Combined plot
+PlotFractions(bind_rows(ovl.hap1, ovl.k562), combined = T)
+
+```
+
+
+### 4. Repeat #2 and #3, but inverted
+
+```{r overlap 2}
+
+ovl.inverse.hap1 <- CalculateOverlapInverted(lads.hap1, compartment.hap1)
+ovl.inverse.k562 <- CalculateOverlapInverted(lads.k562, compartment.k562)
+
+```
+
+```{r plot 2, fig.width = 5, fig.height = 3.5}
+
+# Various plots
+PlotFractionsInverted(ovl.inverse.hap1, main = "Hap1")
+PlotFractionsInverted(ovl.inverse.k562, main = "K562")
+
+```
+
+
+### 5. Repeat, for CTCF peaks
+
+### 5.1. Read data
+
+Read CTCF peaks.
+
+```{r ctcf peaks}
+
+# Read SNIPER output
+peaks.hap1 <- import("ts200318_hic_subcompartments/ts200326_Hap1_ChIP_CTCF_hg38_GSM2493878_peaks.narrowPeak.gz")
+peaks.k562 <- import("ts200318_hic_subcompartments/ts200326_K562_ChIP_CTCF_ENCFF519CXF.narrowPeak.gz")
+peaks.hct116 <- import("ts200318_hic_subcompartments/ts200326_HCT116_ChIP_CTCF_ENCFF518MQA.narrowPeak.gz")
+
+```
+
+
+### 2. Overlap between LADs and subcompartments
+
+With the LADs and compartments, I can compute the overlap.
+
+```{r calculate overlap peaks}
+
+# Chrom sizes
+chrom.sizes <- read.table("~/mydata/data/genomes/GRCh38/hg38.chrom.sizes", sep = "\t")
+row.names(chrom.sizes) <- chrom.sizes[, 1]
+
+chrom.sizes <- chrom.sizes[c(paste0("chr", 1:22), "chrX"), ]
+
+CalculateOverlapPeaks <- function(LADs, peaks, cell) {
+  
+  # Add chrom sizes
+  seqlengths(LADs) <- chrom.sizes[seqlevels(LADs), 2]
+  
+  # Get LAD sizes
+  LAD_class.widths <- c(sum(width(LADs[LADs$diff == -1])),
+                        sum(width(LADs[LADs$diff == 0])),
+                        sum(width(LADs[LADs$diff == 1])))
+  LAD_class.widths[4] <- sum(chrom.sizes[, 2]) - sum(LAD_class.widths)
+  
+  # Intersect peaks with LADs
+  ovl <- findOverlaps(peaks, LADs, type = "any", select = "arbitrary")
+  peaks.lad_status <- LADs$diff[ovl]
+  
+  # Combine into tibble
+  tib <- tibble(class = c("down", "stable", "up", "iLAD"),
+                peaks = c(sum(peaks.lad_status == -1, na.rm = T), 
+                          sum(peaks.lad_status == 0, na.rm = T),
+                          sum(peaks.lad_status == 1, na.rm = T),
+                          sum(is.na(peaks.lad_status))),
+                widths = LAD_class.widths / 1e6) %>%
+    mutate(class = factor(class, levels = c("down", "stable", "up", "iLAD"))) %>% 
+    mutate(density = peaks / widths) %>%
+    add_column(cell = cell)
+  
+  tib
+  
+}
+
+ovl.hap1 <- CalculateOverlapPeaks(lads.hap1, peaks.hap1, cell = "HAP-1")
+ovl.k562 <- CalculateOverlapPeaks(lads.k562, peaks.k562, cell = "K562")
+ovl.hct116 <- CalculateOverlapPeaks(lads.hap1, peaks.hct116, cell = "HCT116")
+
+```
+
+
+### 3. Plot
+
+Plot.
+
+```{r plot peaks, fig.width = 5, fig.height = 3.5}
+
+# Various plots
+PlotFractionsPeaks <- function(ovl, main = "", combined = F) {
+  
+  plt.base <- ovl %>%
+    ggplot(aes(x = class, fill = class)) +
+    xlab("") +
+    ggtitle(main) +
+    scale_fill_brewer(palette = "Set2") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  if (combined) {
+    plt.base <- plt.base +
+      facet_grid(. ~ cell) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1),
+            aspect.ratio = 2)
+  }
+  
+  # Density
+  plt <- plt.base +
+    geom_bar(aes(y = density), stat = "identity") +
+    ylab("#CTCF peaks / Mb")
+  
+  plot(plt)
+  
+}
+
+PlotFractionsPeaks(ovl.hap1, main = "HAP-1")
+PlotFractionsPeaks(ovl.k562, main = "K562")
+PlotFractionsPeaks(ovl.hct116, main = "HCT116")
+
+```
+
+
+```{r combined plot peaks, fig.width = 8, fig.height = 3.5}
+
+# Combined plot
+PlotFractionsPeaks(bind_rows(ovl.hap1, ovl.k562, ovl.hct116), combined = T)
+
+```
+
+
+### Conclusion
+
+There is a small increase in the B1 subcompartment in decreasing LADs. But I
+don't think that this significant and worth including.
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```

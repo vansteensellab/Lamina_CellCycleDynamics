@@ -1,0 +1,1303 @@
+---
+title: "Cell cycle synchronization - correlations of dynamic LADs"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+In previous documents, I have:
+
+  * defined LADs that change during the cell cycle
+  * tried to link these to other data sets
+  
+This was done very inefficiently, unorganized and for the (three) cell types
+separately. I want to make this more generalized, structured and plot the 
+resulting output in a more summarized fashion. 
+
+
+### Method
+
+Overall, this document will replace the documents linking the dynamic LADs to
+other data sets. The method will be the same, although I would like to design a
+different output figure to summarize all data much conveniently. The strategy is
+summarized below.
+
+
+#### Analysis procedure
+
+Various plots.
+
+
+### Set-up
+
+Initially, I want to prepare the input and output. Load in the libraries and 
+set other constants.
+
+#### Load libraries
+
+```{r load libraries}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(RColorBrewer)))
+suppressMessages(suppressWarnings(library(ggbeeswarm)))
+suppressMessages(suppressWarnings(library(limma)))
+suppressMessages(suppressWarnings(library(edgeR)))
+suppressMessages(suppressWarnings(library(gtools)))
+
+```
+
+
+#### Prepare input and output 
+
+```{r prepare input and output}
+
+# The cell lines and file locations of previous analyses
+cells <- c("RPE")
+dir.input.base <- "ts190802_differential_analysis_BinsandLADs_"
+dir.padamid.base <- "/DATA/usr/t.v.schaik/proj/tests/results/ts180813_GCF5083_pADamIDtests/results/normalized/bin-20kb/"
+
+# One output directory, corresponding with this file
+dir.output <- "ts190802_dynamic_LAD_correlations"
+dir.create(dir.output, showWarnings = FALSE)
+
+```
+
+
+#### Set-up knitr
+
+I always appreciate having the markdown figures as png / pdf, as plotted in the
+document. This is set below.
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               dev=c('png', 'pdf'), fig.path = file.path(dir.output, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+
+#### List data sets to compare with
+
+Below, I will provide the data sets that will be processed for this document.
+These consist of (when data is available) :
+
+  * DamID
+  * Replication timing
+  * Gene expression
+  * Histone modifications (repressive only)
+
+```{r data sets}
+
+# Input directories
+dir.damid.base <- "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/normalized/bin-20kb/"
+dir.padamid.base <- "/DATA/usr/t.v.schaik/proj/tests/results/ts190509_RPE_HCT116_synchronization/results/normalized/bin-20kb/"
+dir.repliseq.base <- "/DATA/usr/t.v.schaik/proj/tests/results/ts190301_pADamID_CellCycle/ts190731_4DN_RepliSeq/bigwigs/"
+dir.chip.base <- "/DATA/usr/t.v.schaik/proj/tests/results/ts180813_GCF5083_pADamIDtests/ts190320_pADamID_correlations/histone_correlations/"
+
+data.tracks <- list(
+  
+  # RPE
+  RPE = list(damid_lmnb1 = file.path(dir.damid.base,
+                                        "RPE_LMNB1-20kb-combined.norm.txt.gz"),
+                repliseq = file.path(dir.repliseq.base, 
+                                     "RPE-hTERT_r1_20kb.bw"))
+  
+)
+
+# Confirm that all the files exist
+all(file.exists(unlist(data.tracks)))
+
+# RNA-seq consists of one object with columns for each cell
+rnaseq <- readRDS("/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180130_laminaVsNucleolus/ts180405_GeneExpression_Remapped/genes_expression.rds")
+
+```
+
+
+#### Functions
+
+The last part of the set-up phase is to define functions useful for this 
+document.
+
+```{r functions}
+
+ProcessDamID <- function(track, name, bins) {
+  
+  # DamID is easy, as the scores are already in the same bins
+  damid <- read.table(track,
+                      stringsAsFactors = FALSE,
+                      col.names = c("seqnames", "start", "end", "score"))
+  
+  damid <- as(damid, "GRanges")
+  start(damid) <- start(damid) + 1
+  
+  # Scale
+  mcols(damid) <- scale(as(mcols(damid), "data.frame"))
+  
+  # Return damid scores
+  damid$score
+
+}
+ProcessBigWig <- function(track, name, bins, replicates = c("r1", "r2"), 
+                          log2 = FALSE, pseudo = 0.1) {
+  
+  # RepliSeq is easy, as the scores are already in the same bins - mostly
+  # Even more, there might be more replicates of repliseq, let's take the mean
+  # of those. I previously binned the histone modifications, meaning I can use
+  # the same function for them. 
+  
+  # Loop over replicates, adding the score to the bins
+  for (r in replicates) {
+    
+    # Read repliseq replicate
+    repliseq <- import(gsub("r1", r, track))
+    
+    # Add the score to the bins
+    ovl <- findOverlaps(bins, repliseq)
+    mcols(bins)[, r] <- NA
+    mcols(bins)[queryHits(ovl), r] <- repliseq$score[subjectHits(ovl)]
+  }
+  
+  # Calculate the mean repliseq score
+  if (length(replicates) > 1) {
+    bins$score <- rowMeans(as(mcols(bins)[, replicates], "data.frame"),
+                           na.rm = T)
+  } else {
+    bins$score <- mcols(bins)[, replicates]
+  }
+  
+  if (log2) {
+    bins$score <- log2(bins$score + pseudo)
+  }
+  
+  
+  # Return the mean repliseq score
+  bins$score
+  
+}
+
+```
+
+
+### 1) Load input
+
+First, I will load the required input and prepare the data structure required.
+
+
+```{r load input}
+
+# Loop over cells, reading their files
+samples.df <- list()
+LADs.norm <- list()
+results <- list()
+
+for (cell in cells) {
+  
+  # 1) Samples data frame
+  samples.df <- c(samples.df, 
+                  list(readRDS(file.path(paste0(dir.input.base, 
+                                                cell), 
+                                         "samples_df.rds"))))
+  
+  # 2) Normalized LAD scores
+  LADs.norm <- c(LADs.norm, 
+                 list(readRDS(file.path(paste0(dir.input.base, 
+                                               cell), 
+                                        "LADs_norm.rds"))))
+  
+  # 3) Results differential tests
+  results <- c(results, 
+               list(readRDS(file.path(paste0(dir.input.base, 
+                                             cell), 
+                                      "LADs_results.rds"))))
+  
+}
+
+# Add names to the lists
+names(samples.df) <- names(LADs.norm) <- names(results) <- cells
+
+# Combine samples.df object
+samples.df.combined <- data.frame(do.call(rbind, samples.df))
+
+# Change numeric results to logical factor
+conversion <- c("-1" = "down", "0" = "stable", "1" = "up")
+
+for (cell in cells) {
+  
+  # Change the integers to factors
+  results.cell <- data.frame(results[[cell]])
+  results.copy <- data.frame(do.call(cbind,
+                                     lapply(2,
+                                            function(i) {
+                                              conversion[match(results.cell[, i], 
+                                                               as.numeric(names(conversion)))]
+                                            })))
+  names(results.copy) <- c("G2_G1")
+  results.copy$G2_G1 <- factor(results.copy$G2_G1, levels = c("stable", "down", "up"))
+  
+  # And add this to the LADs
+  mcols(LADs.norm[[cell]]) <- cbind(mcols(LADs.norm[[cell]]),
+                                    results.copy)
+}
+
+```
+
+
+#### Load pA-DamID data
+
+Next, I want to load (bulk) pA-DamID scores for 20kb bins, for every data set.
+Also, calculate the combined score for all the LADs.
+
+```{r load pA-DamID data}
+
+# Loop over the cells 
+padamid <- list()
+
+for (cell in cells) {
+  
+  # Load pA-DamID data, convert to GRanges
+  padamid.cell <- read.table(file.path(dir.padamid.base,
+                             paste0("pADamID-", cell,
+                                    "_bulk_LMNB2-20kb-combined.norm.txt.gz")),
+                             stringsAsFactors = FALSE,
+                             col.names = c("seqnames", "start", "end", "score"))
+  padamid.cell <- as(padamid.cell, "GRanges")
+  
+  # bed to R -> add 1 to the start
+  start(padamid.cell) <- start(padamid.cell) + 1
+  
+  # Get the pA-DamID LAD score
+  #   As with the other data, let's scale the data first
+  padamid.cell$score <- as.numeric(scale(padamid.cell$score))
+  
+  padamid <- c(padamid, list(padamid.cell))
+  
+  # Get the mean score for every LAD
+  LADs.cell <- LADs.norm[[cell]]
+  ovl <- findOverlaps(LADs.cell, 
+                      padamid.cell)
+  
+  LADs.norm[[cell]]$padamid <- do.call(c, tapply(subjectHits(ovl),
+                                                 queryHits(ovl),
+                                                 function(x) mean(padamid.cell$score[x],
+                                                                  na.rm = T),
+                                                 simplify = FALSE))
+}
+
+names(padamid) <- cells
+
+```
+
+
+### 2) Read external data sets
+
+For every cell, for every data track I will now perform the analysis as 
+described earlier. For a final figure, I will save the percentage of values
+higher than zero for every data set. A combination of those might be a nice
+way to visualize the final result.
+
+First, I will read the files.
+
+```{r process the data tracks}
+
+# Loop over the cells
+for (cell in cells) {
+  
+  # Loop over the tracks
+  data.tracks.cell <- data.tracks[[cell]]
+  track.names <- names(data.tracks.cell)
+  
+  for (track.name in track.names) {
+    
+    # Read the track, corresponding to the binned pA-DamID object
+    if (startsWith(track.name, "chip")) {
+      
+      tmp <- ProcessBigWig(data.tracks.cell[[track.name]],
+                           name = track.name,
+                           bins = padamid.cell,
+                           replicates = c("r1"))
+      
+    } else if (startsWith(track.name, "damid") | startsWith(track.name, "padamid")) {
+      
+      tmp <- ProcessDamID(data.tracks.cell[[track.name]],
+                          name = track.name,
+                          bins = padamid.cell)
+      
+    } else if (track.name == "repliseq") {
+      
+      tmp <- ProcessBigWig(data.tracks.cell[[track.name]],
+                           name = track.name,
+                           bins = padamid.cell)
+      
+    }
+    
+    # Add the data to the padamid object
+    mcols(padamid[[cell]])[, track.name] <- tmp
+    
+  }
+  
+  # Overlap with LADs
+  LADs.cell <- LADs.norm[[cell]]
+  ovl <- findOverlaps(LADs.cell, 
+                      padamid[[cell]])
+  
+  # Get the mean score for every LAD
+  tmp <- do.call(rbind, tapply(subjectHits(ovl),
+                               queryHits(ovl),
+                               function(x) colMeans(as(mcols(padamid[[cell]])[x, track.names],
+                                                       "data.frame"),
+                                                    na.rm = T),
+                               simplify = FALSE))
+  
+  mcols(LADs.cell)[, track.names] <- tmp
+  LADs.norm[[cell]] <- LADs.cell
+  
+}
+
+```
+
+
+### 3) LAD dynamics over the cell cycle
+
+Plot the progression throughout the cell cycle.
+
+```{r progression through cell cycle, fig.width = 4, fig.height = 3}
+
+for (cell in cells) {
+  
+  print(cell)
+  
+  # Convert to df
+  df <- as(mcols(LADs.norm[[cell]]), "data.frame")
+  
+  # Add ID
+  df$ID <- 1:nrow(df)
+  
+  # Get the delta - using mean of t=0h
+  df <- cbind(df[, c("G2_G1", "ID")],
+              df[, samples.df.combined$name[samples.df.combined$cell == cell]])
+  
+  df.melt <- melt(df, id.vars = c("G2_G1", "ID"))
+  
+  df.melt$time <- gsub("h_.*", "", gsub(paste0(cell, "_"), "", df.melt$variable))
+  df.melt$time <- as.numeric(df.melt$time)
+  df.melt$G2_G1 <- factor(df.melt$G2_G1, levels = c("stable", "down", "up"))
+  
+  # Plot
+  plt <- ggplot(df.melt, aes(x = time, y = value, col = G2_G1, fill = G2_G1, group = G2_G1)) +
+    stat_summary(fun.y = mean, geom = "line", size = 1.5) +
+    stat_summary(fun.data = mean_sdl, geom = "ribbon", alpha = 0.25, col = NA,
+                 fun.args = list(mult = 1)) +
+    ggtitle("pA-DamID dynamics over time") +
+    #facet_grid(. ~ result) +
+    xlab("Cell cycle phase") +
+    ylab("pA-DamID (log2)") +
+    scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    #scale_color_brewer(palette = "Set1", name = "result") +
+    #scale_fill_brewer(palette = "Set1", name = "result") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+}
+
+
+```
+
+Looks good. Note that the LADs can still decrease a lot after S. Of course, this
+result is now combined with the S-specific biology and thus unreliable.
+
+```{r speed through cell cycle, fig.width = 5.5, fig.height = 3}
+
+for (cell in cells) {
+  
+  print(cell)
+  
+  # Combine replicates
+  LADs.norm.combined <- LADs.norm.cell <-LADs.norm[[cell]]
+  samples <- samples.df[[cell]]
+  
+  mcols(LADs.norm.combined) <- do.call(cbind, 
+                                       tapply(samples$name,
+                                              samples$phase,
+                                              function(x) rowMeans(as(mcols(LADs.norm.cell)[, x], "data.frame"), 
+                                                                   na.rm = T)))
+  
+  # Convert to df
+  df <- as(mcols(LADs.norm.combined), "data.frame")
+  
+  # Add ID
+  df$result <- LADs.norm.cell$G2_G1
+  df$ID <- 1:nrow(df)
+  
+  # For each time point, determine the change per hour
+  timepoints <- unique(samples$time)
+  df.change <- cbind(df[, c("result", "ID")],
+                     t(t(df[, 2:5] - df[, 1:4]) / (timepoints[2:5] - timepoints[1:4])))
+  
+  # Melt
+  df.melt <- melt(df.change, id.vars = c("result", "ID"))
+  df.melt$time <- as.numeric(gsub("h.*", "", gsub("t_", "", df.melt$variable)))
+  #df.melt$time <- (df.melt$time + timepoints[match(df.melt$time, timepoints) - 1]) / 2
+  
+  # Plot
+  plt <- ggplot(df.melt, aes(x = time, y = value, col = result, fill = result)) +
+    stat_summary(fun.y = mean, geom = "line", size = 1.5) +
+    stat_summary(fun.data = mean_sdl, geom = "ribbon", alpha = 0.25, col = NA,
+                 fun.args = list(mult = 1)) +
+    ggtitle("pA-DamID dynamics over time") +
+    #facet_grid(. ~ result) +
+    xlim(0, max(timepoints)) +
+    xlab("time (h)") +
+    ylab("change per hour") +
+    scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plot(plt)
+  
+  # Also, make a different plot
+  plt <- ggplot(df.melt, aes(x = variable, y = value, col = result, fill = result)) +
+    geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+    geom_boxplot(outlier.shape = NA, col = "black") +
+    xlab("time") +
+    ylab("change per hour") +
+    coord_cartesian(ylim = c(-0.42, 0.24)) +
+    scale_x_discrete(labels = c("1h -> 3h", "3h -> 6h", "6h -> 10h", "10h -> 21h")) +
+    scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)]) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  plot(plt)
+  
+}
+
+```
+
+
+### 4) Gene expression
+
+How do the dynamic LADs correlate with gene expression?
+
+```{r rnaseq, fig.width = 2.5, fig.height = 3}
+
+df.combined <- c()
+
+for (cell in cells) {
+  
+  print(cell)
+  
+  # LAD status to genes
+  LADs <- LADs.norm[[cell]]
+  ovl <- findOverlaps(rnaseq, LADs, type = "within")
+  
+  # Convert to df
+  df <- as(mcols(rnaseq), "data.frame")[, c("gene_id", "gene_name", cell)]
+  names(df)[3] <- "expr"
+  
+  df$result <- factor("iLAD", levels = c(levels(LADs$G2_G1), "iLAD"))
+  df$result[queryHits(ovl)] <- LADs$G2_G1[subjectHits(ovl)]
+  
+  # Complete cases
+  df <- df[complete.cases(df), ]
+  
+  # Plot beeswarm
+  plt <- ggplot(df, aes(x = result, y = expr, col = result, group = result)) +
+    geom_quasirandom() +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "black", width = 0.3) +
+    ggtitle("Gene change versus gene expression") +
+    xlab("pA-DamID change") +
+    ylab("Gene expression (rlog2)") +
+    scale_color_brewer(palette = "Set1") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  # plot(plt)
+  
+  
+  # What are active genes?
+  plt <- ggplot(df, aes(x = expr)) +
+    geom_histogram(binwidth = 1) +
+    geom_vline(xintercept = 7, col = "red", linetype = "dashed") +
+    xlab("Gene expression (rlog)") +
+    ylab("Count") +
+    ggtitle("Gene expression histogram") +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  # plot(plt)
+  
+  
+  # Let's say rlog > 7
+  cutoff <- 7
+  
+  # Gene density
+  LADs$gene_density <- countOverlaps(LADs, rnaseq, type = "any") / width(LADs) * 1e6
+  LADs$gene_density.active <- countOverlaps(LADs, rnaseq[mcols(rnaseq)[, cell] > cutoff], 
+                                            type = "any") / width(LADs) * 1e6
+  
+  # Get the data frame
+  df <- as(mcols(LADs), "data.frame")
+  # df <- df[complete.cases(df), ]
+  
+  # Plot beeswarm
+  plt <- ggplot(df, aes(x = G2_G1, y = gene_density, fill = G2_G1, group = G2_G1)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle("Gene change versus gene density") +
+    xlab("pA-DamID change") +
+    ylab("# genes / Mb") +
+    scale_color_brewer(palette = "Set1", name = "result") +
+    coord_cartesian(ylim = c(0, 18)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # plot(plt)
+  
+  plt <- ggplot(df, aes(x = G2_G1, y = gene_density.active, fill = G2_G1, group = G2_G1)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle("Gene change versus gene density") +
+    xlab("pA-DamID change") +
+    ylab("# active genes / Mb") +
+    scale_color_brewer(palette = "Set1", name = "result") +
+    coord_cartesian(ylim = c(0, 6)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # plot(plt)
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("gene_density.active", "cell", "G2_G1")])
+  
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = c("RPE"))
+
+plt <- ggplot(df.combined, aes(x = cell, y = gene_density.active, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Active gene density") +
+  xlab("") +
+  ylab("# active genes / Mb") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  coord_cartesian(ylim = c(0, 6)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+Variable.
+
+
+### 5) Replication timing
+
+How are the replication timing scores for these changing domains?
+
+```{r repliseq, fig.width = 2.5, fig.height = 3}
+
+df.combined <- c()
+
+for (cell in cells) {
+  
+  if (cell == "Hap1") {
+    next
+  }
+  
+  print(cell)
+  
+  LADs <- LADs.norm[[cell]]
+  
+  # Get the data frame
+  df <- as(mcols(LADs), "data.frame")
+  df <- df[complete.cases(df), ]
+  
+  # Plot beeswarm
+  plt <- ggplot(df, aes(x = G2_G1, y = repliseq, fill = G2_G1)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle("Repliseq change versus gene expression") +
+    xlab("pA-DamID change") +
+    ylab("RepliSeq") +
+    scale_color_brewer(palette = "Set1", name = "result") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # plot(plt)
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("repliseq", "cell", "G2_G1")])
+   
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = c("RPE"))
+
+plt <- ggplot(df.combined, aes(x = cell, y = repliseq, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Repliseq score") +
+  xlab("") +
+  ylab("repliseq") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  # coord_cartesian(ylim = c(0, 6)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+  
+```
+
+Variable.
+
+
+### 6) LAD characteristics
+
+Finally, let's make some plots on the characteristics: LAD strength and
+LAD size.
+
+```{r LAD characteristics, fig.width = 2.5, fig.height = 3}
+
+df.combined <- c()
+
+for (cell in cells) {
+  
+  print(cell) 
+  
+  # Get all the data
+  df <- as(LADs.norm[[cell]], "data.frame")
+  
+  # 1) Size distribution versus changes
+  plt <- ggplot(df, aes(x = G2_G1, y = width / 1e6, fill = G2_G1)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggtitle("LAD size versus LAD change") +
+    xlab("pA-DamID change") +
+    ylab("LAD size (Mb)") +
+    scale_color_brewer(palette = "Set1", name = "result") +
+    coord_cartesian(ylim = c(0, 8)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # plot(plt)
+  
+  # 2) Initial strength
+  # Note: this can already be seen in the first plot
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("width", "cell", "G2_G1")])
+  
+  
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = c("RPE"))
+
+plt <- ggplot(df.combined, aes(x = cell, y = width / 1e6, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("LAD size") +
+  xlab("") +
+  ylab("LAD size (Mb)") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  coord_cartesian(ylim = c(0, 6)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+
+### 7) Chromosomal positioning
+
+Distance to telomeres / centromeres.
+
+```{r telomeres and centromeres, fig.width = 2.5, fig.height = 3}
+
+# Read chrom sizes
+chrom_sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes", sep = "\t")
+row.names(chrom_sizes) <- chrom_sizes[, 1]
+
+# Function to scale chromosome arms
+ScaleChromosomeArms <- function(gr, chrom_sizes, centromeres.gr, inverse = FALSE) {
+  # For a given "gr" GRanges object, calculate the relative distance to a
+  # chromosome arm. 
+  
+  # Calculate distance to centromere for every gene
+  gr$distance_to_centromere <- mcols(distanceToNearest(gr, centromeres.gr))$distance
+  gr$distance_to_centromere <- as.numeric(gr$distance_to_centromere)
+  
+  # For each chromosome
+  #   if start of gene is left of the centromere,
+  #     normalize the distance by the first base - start centromere distance
+  #   else
+  #     normalize by the distance by the end centromere - last base
+  for (chr in seqlevels(gr)) {
+    centromeres.chr <- centromeres.gr[seqnames(centromeres.gr) == chr]
+    left_arm <- start(centromeres.chr) - 1
+    right_arm <- chrom_sizes[chr, 2] - end(centromeres.chr)
+    
+    idx <- seqnames(gr) %in% chr
+    gr.tmp <- gr[idx]
+    
+    norm_dis <- ifelse(start(gr.tmp) < start(centromeres.chr),
+                       gr.tmp$distance_to_centromere / left_arm,
+                       gr.tmp$distance_to_centromere / right_arm)
+    
+    # If inverse, inverse the distance (meaning towards telomeres)
+    if (inverse) {
+      norm_dis <- 1 - norm_dis
+    }
+    
+    mcols(gr[idx])[, "distance_to_centromere"] <- norm_dis
+  }
+  
+  # Return normalized distances
+  gr$distance_to_centromere
+}
+
+# Define telomeres & load centromeres
+telomeres <- GRanges(seqnames = rep(seqlevels(LADs), times = 2),
+                     ranges = IRanges(start = c(rep(1, length(seqlevels(LADs))),
+                                                seqlengths(LADs)),
+                                      end = c(rep(1, length(seqlevels(LADs))),
+                                              seqlengths(LADs))))
+centromeres <- import("ts190612_differential_analysis_BinsandLADs_RPE/centromeres.bed")
+
+# Prep output df
+df.combined <- c()
+
+for (cell in cells) {
+  
+  LADs <- LADs.norm[[cell]]
+  
+  # Distance to telomeres data frame
+  LADs$distance_to_telomeres <- mcols(distanceToNearest(LADs, telomeres))$distance / 1e6
+  LADs$distance_to_centromeres <- mcols(distanceToNearest(LADs, centromeres))$distance / 1e6
+  LADs$distance_to_telomeres_scaled <- ScaleChromosomeArms(LADs, chrom_sizes, 
+                                                             centromeres, inverse = T)
+  
+  LADs$seqnames <- seqnames(LADs)
+  
+  # Add mean t_1h / t_21h
+  mcols(LADs)[, "t_1h"] <- rowMeans(as(mcols(LADs), "data.frame")[, samples.df[[cell]]$name[samples.df[[cell]]$phase == "t_1h"]])
+  mcols(LADs)[, "t_3h"] <- rowMeans(as(mcols(LADs), "data.frame")[, samples.df[[cell]]$name[samples.df[[cell]]$phase == "t_3h"]])
+  mcols(LADs)[, "t_6h"] <- rowMeans(as(mcols(LADs), "data.frame")[, samples.df[[cell]]$name[samples.df[[cell]]$phase == "t_6h"]])
+  mcols(LADs)[, "t_10h"] <- rowMeans(as(mcols(LADs), "data.frame")[, samples.df[[cell]]$name[samples.df[[cell]]$phase == "t_10h"]])
+  mcols(LADs)[, "t_21h"] <- rowMeans(as(mcols(LADs), "data.frame")[, samples.df[[cell]]$name[samples.df[[cell]]$phase == "t_21h"]])
+  mcols(LADs)[, "diff"] <- LADs$t_21h - LADs$t_1h
+  
+  # Add LAD size
+  mcols(LADs)[, "size"] <- width(LADs) / 1e6
+  
+  df <- as(mcols(LADs), "data.frame")
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("distance_to_telomeres", "distance_to_centromeres", 
+                              "distance_to_telomeres_scaled", "t_1h", "t_3h", 
+                              "t_6h", "t_10h", "t_21h", 
+                              "diff", "size", "cell", "G2_G1", "seqnames")])
+  
+  
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = c("RPE"))
+
+# Order chromosomes by length
+df.combined$seqnames <- factor(df.combined$seqnames,
+                               levels = seqlevels(LADs)[order(seqlengths(LADs), 
+                                                              decreasing = T)])
+
+plt <- ggplot(df.combined, aes(x = cell, y = distance_to_telomeres, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Telomeres") +
+  xlab("") +
+  ylab("Distance to telomeres (Mb)") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  #coord_cartesian(ylim = c(0, 8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+plt <- ggplot(df.combined, aes(x = cell, y = distance_to_centromeres, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Centromeres") +
+  xlab("") +
+  ylab("Distance to centromeres (Mb)") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  #coord_cartesian(ylim = c(0, 8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+# Extra plots 
+# 1) Scaled chromosome arms to prevent the outliers chromosomes to account for
+#    differences in chromosome length
+plt <- ggplot(df.combined, aes(x = cell, y = distance_to_telomeres_scaled, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Telomeres - scaled") +
+  xlab("") +
+  ylab("Distance to telomeres - scaled") +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  #coord_cartesian(ylim = c(0, 8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+```{r extra figures telomere distance 1, fig.width = 5, fig.height = 3.5}
+
+# 2) Distribution of dynamic LADs across the chromosomes
+plt <- ggplot(df.combined, aes(x = seqnames, fill = G2_G1)) +
+  geom_bar() + 
+  ggtitle("Telomeres - scaled") +
+  xlab("") +
+  ylab("# Dynamic LADs") +
+  facet_grid(cell ~ .) +
+  #scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  #coord_cartesian(ylim = c(0, 8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+
+
+# 4) LAD differences versus telomere distance
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = diff)) +
+  geom_point(aes(col = seqnames), #alpha = 0.5, 
+             size = 1) +
+  geom_smooth(method = "loess", se = F) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  facet_grid(cell ~ .) +
+  ggtitle("Telomeres distance") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("Difference 21h - 1h") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+# 5) LAD differences versus centromere distance
+plt <- ggplot(df.combined, aes(x = distance_to_centromeres, y = diff)) +
+  geom_point(aes(col = seqnames), #alpha = 0.5, 
+             size = 1) +
+  geom_smooth(method = "loess", se = F) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  facet_grid(cell ~ .) +
+  ggtitle("Centromere distance") +
+  xlab("Distance to centromeres (Mb)") +
+  ylab("Difference 21h - 1h") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+# 6) LAD differences versus centromere distance
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres_scaled, y = diff)) +
+  geom_point(aes(col = seqnames), #alpha = 0.5, 
+             size = 1) +
+  geom_smooth(method = "loess", se = F) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  facet_grid(cell ~ .) +
+  ggtitle("Telomeres distance") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("Difference 21h - 1h") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+# 7) LAD differences versus telomere distance - colored by LAD size
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = diff)) +
+  geom_point(aes(col = log2(size)), alpha = 0.5, size = 1) +
+  geom_smooth(method = "loess", se = F) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  facet_grid(cell ~ .) +
+  ggtitle("Telomeres distance") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("Difference 21h - 1h") +
+  scale_color_continuous(low = "black", high = "lightgrey") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+# 8) LAD differences versus telomere distance - colored by differential call
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = diff)) +
+  geom_point(aes(col = G2_G1), alpha = 0.5, size = 1) +
+  geom_smooth(method = "loess", se = F) +
+  geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+  facet_grid(cell ~ .) +
+  ggtitle("Telomeres distance") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("Difference 21h - 1h") +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                     name = "result") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+
+```
+
+```{r telomeres per time point, fig.width = 10, fig.height = 3.5}
+
+# 9) scores near telomeres for every time points
+df.combined.melt <- melt(df.combined, 
+                         measure.vars = c("t_1h", "t_3h", "t_6h", "t_10h", "t_21h"))
+
+plt <- ggplot(df.combined.melt, aes(x = distance_to_telomeres, y = value)) +
+    geom_point(aes(col = seqnames), #alpha = 0.5, 
+               size = 1) +
+    geom_smooth(method = "loess", se = F) +
+    geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+    facet_grid(cell ~ variable) +
+    #ggtitle("Telomeres distance") +
+    xlab("Distance to telomeres (Mb)") +
+    ylab("scaled pA-DamID") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+
+# scores near centromeres
+plt <- ggplot(df.combined.melt, aes(x = distance_to_centromeres, y = value)) +
+    geom_point(aes(col = seqnames), #alpha = 0.5, 
+               size = 1) +
+    geom_smooth(method = "loess", se = F) +
+    geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+    facet_grid(cell ~ variable) +
+    #ggtitle("Centromere distance") +
+    xlab("Distance to centromeres (Mb)") +
+    ylab("scaled pA-DamID") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+
+
+
+# No colors - lower the y-axis
+cutoff <- -0.6
+df.combined.melt2 <- df.combined.melt
+df.combined.melt2 <- df.combined.melt2[df.combined.melt2$value < cutoff, ]
+df.combined.melt2$value <- cutoff
+
+plt <- ggplot(df.combined.melt, aes(x = distance_to_telomeres, y = value)) +
+    geom_point(data = df.combined.melt[df.combined.melt$value >= cutoff, ], size = 1) +
+    geom_point(data = df.combined.melt2, shape = 2, size = 1) +
+    geom_smooth(method = "loess", se = F, col = "red", size = 2) +
+    geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+    facet_grid(cell ~ variable) +
+    #ggtitle("Telomeres distance") +
+    coord_cartesian(ylim = c(cutoff, 1.3)) +
+    xlab("Distance to telomeres (Mb)") +
+    ylab("Lamina contacts") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+
+# scores near centromeres
+plt <- ggplot(df.combined.melt, aes(x = distance_to_centromeres, y = value)) +
+    geom_point(data = df.combined.melt[df.combined.melt$value >= cutoff, ], size = 1) +
+    geom_point(data = df.combined.melt2, shape = 2, size = 1) +
+    geom_smooth(method = "loess", se = F, col = "red", size = 2) +
+    geom_hline(yintercept = 0, col = "grey", linetype = "dashed") +
+    facet_grid(cell ~ variable) +
+    #ggtitle("Telomeres distance") +
+    coord_cartesian(ylim = c(cutoff, 1.3)) +
+    xlab("Distance to centromeres (Mb)") +
+    ylab("Lamina contacts") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1),
+        aspect.ratio = 1)
+
+plot(plt)
+
+
+```
+
+```{r extra figures telomere distance 2, fig.width = 7, fig.height = 5}
+
+# 3) Overkill: per-chromosome plots
+plt <- ggplot(df.combined, aes(x = cell, y = distance_to_telomeres_scaled, 
+                               fill = G2_G1)) +
+  geom_boxplot(outlier.shape = NA, position = "dodge") +
+  ggtitle("Telomeres") +
+  xlab("") +
+  ylab("Distance to telomeres (Mb)") +
+  facet_wrap(~ seqnames) +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                    name = "result") +
+  #coord_cartesian(ylim = c(0, 8)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+
+### 8) cLAD enrichment
+
+```{r cLADs, fig.width = 2.5, fig.height = 3}
+
+# Load cLADs
+cLADs <- readRDS("/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180130_laminaVsNucleolus/ts180131_differential_localization/DamID_cLADs.rds")
+
+# Prep output df
+df.combined <- c()
+
+for (cell in cells) {
+  
+  LADs <- LADs.norm[[cell]]
+  
+  ovl <- overlapsAny(cLADs, LADs[LADs$G2_G1 == "stable"])
+  ovl.up <- overlapsAny(cLADs, LADs[LADs$G2_G1 == "up"])
+  ovl.down <- overlapsAny(cLADs, LADs[LADs$G2_G1 == "down"])
+  
+  df <- data.frame(class = c("cAD", "ciAD", "fAD"),
+                   stable = as.vector(table(cLADs$calls[ovl])),
+                   down = as.vector(table(cLADs$calls[ovl.down])),
+                   up = as.vector(table(cLADs$calls[ovl.up])))
+  
+  df[, 2:4] <- t(t(df[, 2:4]) / colSums(df[, 2:4]))
+  df <- melt(df, id.vars = "class")
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("class", "variable", "value", "cell")])
+  
+  
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = c("RPE"))
+
+plt <- ggplot(df.combined, aes(x = variable, y = value, fill = class)) + 
+  geom_bar(stat = "identity") +
+  ggtitle("cLAD enrichment") +
+  xlab("") +
+  ylab("Percentage") +
+  #facet_grid(. ~ cell) +
+  #scale_fill_brewer(palette = "Set2") +
+  scale_fill_grey() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+
+### 9) LAD size & telomere distance
+
+It looks as if LAD size & telomere distance are important. Are these 
+complementary: being a small LAD OR close to telomeres, either is fine.
+
+```{r lad size and telomere distance, fig.width = 8, fig.height = 3}
+
+# Prep output df
+df.combined <- c()
+
+for (cell in cells) {
+  
+  LADs <- LADs.norm[[cell]]
+  
+  # Distance to telomeres data frame
+  LADs$distance_to_telomeres <- mcols(distanceToNearest(LADs, telomeres))$distance / 1e6
+  LADs$distance_to_centromeres <- mcols(distanceToNearest(LADs, centromeres))$distance / 1e6
+  LADs$size <- width(LADs) / 1e6
+  
+  df <- as(mcols(LADs), "data.frame")
+  
+  df$cell <- cell
+  df.combined <- rbind(df.combined, 
+                       df[, c("distance_to_telomeres", "distance_to_centromeres", "size",
+                              "cell", "G2_G1")])
+  
+  
+}
+
+df.combined$cell <- factor(df.combined$cell, levels = cells)
+df.combined <- df.combined[order(df.combined$G2_G1), ]
+
+# Prepare a scatterplot
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = size, color = G2_G1)) + 
+  geom_point(size = 0.5, alpha = 1) +
+  ggtitle("cLAD enrichment") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("LAD size (Mb)") +
+  #facet_grid(. ~ cell) +
+  scale_color_manual(values = brewer.pal(9, "Set1")[c(9, 1, 3)],
+                     name = "result") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+
+plot(plt)
+
+```
+
+
+### 10) Linear modeling
+
+I want to make the point that LAD size and distance to telomeres are mostly 
+independent. Bas suggested linear modeling with an interaction term. Let's have
+a look. 
+
+```{r linear modeling, fig.height = 3.5, fig.width = 5}
+
+# The object "df" still contains the LAD values
+# First, I want to determine the average slope for the various LADs
+df.data <- df[, 1:10]
+df.data$LAD <- 1:nrow(df.data)
+df.data <- melt(df.data, id.vars = c("LAD"))
+
+df.data$time <- as.numeric(gsub("h", "", 
+                                sapply(strsplit(as.character(df.data$variable), 
+                                                "_"),
+                                       function(x) x[2])))
+
+# Calculate the slope per LAD
+df$slope <- tapply(1:nrow(df.data), df.data$LAD, simplify = T, function(x) {
+  tmp <- df.data[x, ]
+  l <- lm(data = tmp, formula = value ~ time)
+  slope <- coefficients(l)[2]
+  slope
+})
+
+# Also simply determine the difference between G1 and G2
+df$G2_min_G1 <- rowMeans(df[, 9:10]) - rowMeans(df[, 1:2])
+
+# Filter data frame
+df.combined <- df[, c("distance_to_telomeres", "distance_to_centromeres", "size",
+                              "cell", "G2_G1", "slope", "G2_min_G1")]
+
+# Linear modeling
+# 1) Slope
+l <- lm(data = df.combined, formula = slope ~ distance_to_telomeres + size + distance_to_telomeres * size)
+summary(l)
+
+# 2) G2 min G1
+l <- lm(data = df.combined, formula = G2_min_G1 ~ distance_to_telomeres + size + distance_to_telomeres * size)
+summary(l)
+
+
+# Alternative method: what is the correlation between the two features?
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = size)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", col = "blue", linetype = "dashed") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("LAD size (Mb)") +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+plot(plt)
+
+plt <- ggplot(df.combined, aes(x = distance_to_telomeres, y = size)) +
+  geom_point() +
+  geom_smooth(method = "lm", col = "blue", linetype = "dashed") +
+  xlab("Distance to telomeres (Mb)") +
+  ylab("LAD size (Mb)") +
+  theme_classic() +
+  theme(aspect.ratio = 1)
+
+plot(plt)
+
+cor(df.combined$distance_to_telomeres, df.combined$size, method = "spearman")
+cor(df.combined$distance_to_telomeres, df.combined$size, method = "pearson")
+
+```
+
+Based on these extreme weak correlations and the relatively low interaction 
+term, I conclude that these features are mostly independent.
+
+
+### Conclusion
+
+Important message: there is no correlation between DNA characteristics and 
+lamina cell cycle dynamics. The main feature really is telomere positioning.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,592 @@
+---
+title: "A comparison of autocorrelations between pA-DamID and DamID"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+### Introduction
+
+One reviewer commented that it would be useful to know and validate the 
+resolution of pA-DamID. Real estimates of data resolution are difficult from
+our data, given the biological nature of the data. This really requires 
+artificial experimental systems such as lacO integrations, where you know the
+protein binding sites and can estimate the reach of the method. Alternatively,
+you might be able to do this from transcription factor binding sites. However,
+we don't have either of these.
+
+Instead, we will "evade" the question with a comparison between pA-DamID and 
+DamID. Given the size of LADs, you expect high autocorrelations in NL binding 
+data. By calculating and comparing the autocorrelation for DamID and pA-DamID 
+data (for a given total read count), we can make estimations of the maximum 
+resolution that you can get.
+
+Let's see whether this idea actually works.
+
+
+### Method
+
+Calculate autocorrelation function of downscaled DamID and pA-DamID data.
+
+
+### Set-up
+
+Load the libraries and set the parameters.
+
+```{r set-up}
+
+# Load dependencies
+library(tidyverse)
+library(yaml)
+library(GenomicRanges)
+library(rtracklayer)
+
+# # Prepare output 
+output.dir <- "ts200317_comparing_autocorrelations"
+dir.create(output.dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, dev=c('png', 'pdf'), 
+               fig.path = file.path(output.dir, "figures/")) 
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+PrepareMetadata <- function(input.dir, config.file, class, 
+                            sample.parts = c("cell", "target"),
+                            additional.filter = NULL) {
+  
+  # Get the data from the config file
+  config <- read_yaml(config.file)
+  config.dam_controls <- config$dam_controls
+  config.replicates <- config$replicates
+  
+  tib <- tibble(sample = unlist(config.replicates),
+                replicate = rep(names(config.replicates), 
+                                times = sapply(config.replicates, length)),
+                class = class) %>%
+    separate(replicate, sample.parts, remove = F) %>%
+    filter(cell %in% cells,
+           target %in% targets) %>%
+    mutate(dam = unlist(config.dam_controls[sample])) %>%
+    mutate(sample.file = file.path(input.dir, paste0(sample, "-gatc.counts.txt.gz")),
+           dam.file = file.path(input.dir, paste0(dam, "-gatc.counts.txt.gz"))) %>%
+    dplyr::select(sample, dam, replicate, class, cell, target, sample.file, dam.file)
+  
+  if (! is.null(additional.filter)) {
+    tib <- tib %>%
+      filter(grepl(additional.filter, sample))
+  }
+  
+  tib
+}
+
+ReadCounts <- function(i, dam = F) {
+  
+  f <- ifelse(dam == F,
+              metadata$sample.file[i],
+              metadata$dam.file[i])
+  s <- metadata$sample[i]
+  
+  read_tsv(f, 
+           col_names = c("seqnames", 
+                         "start", 
+                         "end", 
+                         "count"),
+           col_types = cols_only(
+             count = col_double()
+           ),
+           progress = FALSE) %>%
+    rename_at(vars(names(.)), ~s)
+}
+
+DownSampling <- function(i, tib, sampling) {
+  # A function to downsample the data, using random sampling without replacement.
+  # While this function might be a bit slow, it is completely random sampling.
+  
+  # Get data
+  x <- tib %>% pull(i)
+  s <- metadata.downsample$sample[i]
+  
+  # Downsampling
+  names(x) <- 1:length(x)
+  
+  y <- sample(rep(names(x), x),
+              size=sampling, replace=FALSE)
+  y <- table(factor(y, levels=names(x)))
+  
+  # Prepare output tibble with names
+  tibble(count = as.vector(y)) %>%
+    rename_at(vars(names(.)), ~ s)
+  
+}
+
+NormReads <- function(tib, n = 1e6) {
+  # Normalize for library size (in reads / M)
+  tmp <- data.frame(t(t(tib) / colSums(tib)) * n)
+  tmp <- as_tibble(tmp) %>%
+    rename_at(vars(names(.)), ~ names(tib))
+  tmp
+}
+
+CreateBins <- function(gatc.fragments, bin, chromosomes = NULL) {
+    # Create bins of width "bin", using a genome size table (file)
+    
+    # First, read the genome size and select chromosomes
+    g <- tibble(seqnames = seqlevels(gatc.fragments),
+                seqlengths = seqlengths(gatc.fragments))
+    
+    if (! is.null(chromosomes)) {
+      g <- g %>% filter(seqnames %in% chromosomes)
+    }
+    
+    # For each chromosome, create bins
+    start <- unlist(sapply(g$seqnames, 
+                           function(x) seq(from=1, by=bin, 
+                                           to=g$seqlengths[g$seqnames == x])))
+    
+    end <- unlist(sapply(g$seqnames, function(x) {
+      s <- seq(from=bin, 
+               by=bin, 
+               to=ceiling(g$seqlengths[g$seqnames == x]/bin)*bin)
+      s[length(s)] <- g$seqlengths[g$seqnames == x]
+      s
+    }))
+    
+    # Assert that everything is okay
+    if (length(start) != length(end)) {
+        stop("Oops, something went wrong with the binning")
+    }
+    
+    # Create GRanges
+    bins <- GRanges(seqnames = rep(g$seqnames, ceiling(g$seqlengths / bin)),
+                    ranges = IRanges(start, end))
+    seqlevels(bins) <- seqlevels(gatc.fragments)
+    seqinfo(bins) <- seqinfo(gatc.fragments)
+    bins <- sort(bins)
+    bins
+}
+
+CountInBins <- function(bins, gr, counts) {
+  # Collapse fragment counts into bins. For this, use the middle of the bin
+  
+  mid <- start(gr) + floor((end(gr)-start(gr))/2)
+  mid <- GRanges(seqnames(gr),
+                 IRanges(mid, mid))
+  
+  ovl <- findOverlaps(mid, bins, type='within')
+  # stopifnot(all.equal(seq_along(gff.middle), queryHits(ovl)))
+  if (all.equal(seq_along(mid), queryHits(ovl)) != TRUE) {
+    cat("Note: not all fragments counted into bins!\n")
+  }
+  
+  # Note: put the unique subjectHits in order (chromosome order)    
+  mcols(bins)[, names(counts)] <- 0 
+  mcols(bins)[sort(unique(subjectHits(ovl))), ] <- 
+    do.call(rbind,
+            tapply(
+              queryHits(ovl),
+              subjectHits(ovl),
+              function(x) colSums(counts[x, ])))
+  
+  bins
+  
+}
+
+NormDam <- function(gr, c.lam, c.dam, pseudo = 1, min.reads = 0) {
+  
+  idx.low_reads <- c.lam + c.dam < min.reads
+  
+  # Add pseudocount for later divisions
+  c.lam.df <- c.lam + pseudo
+  c.dam.df <- c.dam + pseudo
+  
+  # Create normalized table
+  norm <- log2(c.lam.df / c.dam.df)
+  
+  # Few reads == NA
+  norm[idx.low_reads] <- NA
+  
+  norm <- as_tibble(norm) %>%
+    rename_at(vars(names(.)), ~ names(mcols(gr)))
+  mcols(gr) <- norm
+  
+  gr
+  
+}
+
+CalculateACF <- function(bins.norm, bin) {
+  
+  acf.values <- sapply(1:ncol(mcols(bins.norm)),
+                       function(i) {
+                         acf(mcols(bins.norm)[, i],
+                             lag.max = 2, na.action = na.pass,
+                             plot = F)$acf[2]
+                       })
+  
+  acf.tib <- tibble(sample = names(mcols(bins.norm)),
+                    acf = acf.values, 
+                    bin = bin)
+  acf.tib
+  
+}
+
+```
+
+
+### 1. List and load samples
+
+I need to do this for pA-DamID and DamID data.
+
+First, let's list the cells and antibodies that I will look at.
+
+```{r list targets, cache = T}
+
+# List input targets
+cells <- c("Hap1", "K562", "HCT116", "RPE")
+targets <- c("LMNB1", "LMNB2", "LMNAC")
+
+```
+
+Prepare the metadata.
+
+```{r prepare metadata, cache = T}
+
+# Read all required metadata
+metadata.padamid <- PrepareMetadata(input.dir = "results/counts/bin-gatc/",
+                                    config.file = "bin/snakemake/config.yaml",
+                                    class = "pADamID")
+
+metadata.padamid.rpe <- PrepareMetadata(input.dir = "../ts190509_RPE_HCT116_synchronization/results/counts/bin-gatc/",
+                                        config.file = "../ts190509_RPE_HCT116_synchronization/bin/snakemake/config.yaml",
+                                        class = "pADamID",
+                                        sample.parts = c("f1", "cell", "f2", "target"),
+                                        additional.filter = "bulk")
+
+metadata.damid <- PrepareMetadata(input.dir = "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/counts/bin-gatc/",
+                                  config.file = "/DATA/usr/t.v.schaik/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/bin/snakemake/config.yaml",
+                                  class = "DamID")
+
+# Combine metadata
+metadata <- bind_rows(metadata.padamid, 
+                      metadata.padamid.rpe, 
+                      metadata.damid)
+
+metadata %>%
+  tbl_df %>%
+  print(n = 100)
+
+```
+
+Read the counts.
+
+```{r read counts, cache = T}
+
+# Read data
+gatc.fragments <- read_tsv(metadata$sample.file[1], 
+                           col_names = c("seqnames", "start", "end", "count"),
+                           col_types = cols_only(seqnames = col_character(),
+                                                 start = col_double(),
+                                                 end = col_double())) %>%
+  as("GRanges")
+start(gatc.fragments) <- start(gatc.fragments) + 1
+
+# Add chrom sizes
+chrom.sizes <- read.table("/DATA/usr/t.v.schaik/data/genomes/GRCh38/hg38.chrom.sizes", 
+                          sep = "\t")
+row.names(chrom.sizes) <- chrom.sizes[, 1]
+
+seqlengths(gatc.fragments) <- chrom.sizes[seqlevels(gatc.fragments), 2]
+
+# Read counts
+counts.lam <- do.call(bind_cols,
+                      lapply(1:nrow(metadata), ReadCounts))
+
+counts.dam <- do.call(bind_cols,
+                      lapply(1:nrow(metadata), ReadCounts, dam = T))
+
+```
+
+Finally, save the counts as .rds files.
+
+```{r save rds of counts, cache = T}
+
+# Save rds files
+fragments.rds <- file.path(output.dir, "fragments.rds")
+saveRDS(gatc.fragments, fragments.rds)
+
+counts.lam.rds <- file.path(output.dir, "counts_lam.rds")
+saveRDS(counts.lam, counts.lam.rds)
+
+counts.dam.rds <- file.path(output.dir, "counts_dam.rds")
+saveRDS(counts.dam, counts.dam.rds)
+
+```
+
+At this point, I have all GATC counts for all relevant experiment. With this,
+I can start with the real analysis. Note that all previous chuncks are cached, 
+that should prevent too long loading times when preparing output documents.
+
+
+### 2. Filter and downsample samples
+
+I want to use a given number of reads for downsampling, let's say 5M target
+and 5M Dam reads. This should allow for honest comparisons. This means that I
+have to filter and downsample samples. Again, let's cache and save intermediate 
+results as downsampling is intense.
+
+```{r filter samples, cache = T}
+
+# Find samples with too few reads
+reads.cutoff <- 5e6
+
+idx.lam <- colSums(counts.lam) > reads.cutoff
+idx.dam <- colSums(counts.dam) > reads.cutoff
+idx <- idx.lam & idx.dam
+
+metadata.downsample <- metadata[idx, ]
+counts.lam.downsample <- counts.lam[, idx]
+counts.dam.downsample <- counts.dam[, idx]
+
+```
+
+Downsampling.
+
+```{r downsample, cache = T}
+
+# Downsampling to #reads.cutoff reads
+set.seed(123)
+
+counts.lam.downsample <- do.call(bind_cols,
+                                 lapply(1:nrow(metadata.downsample), 
+                                        DownSampling, 
+                                        tib = counts.lam.downsample,
+                                        sampling = reads.cutoff))
+
+counts.dam.downsample <- do.call(bind_cols,
+                                 lapply(1:nrow(metadata.downsample), 
+                                        DownSampling, 
+                                        tib = counts.dam.downsample,
+                                        sampling = reads.cutoff))
+
+# Normalize to 1M reads
+counts.lam.downsample <- NormReads(counts.lam.downsample)
+counts.dam.downsample <- NormReads(counts.dam.downsample)
+
+# Save downsampled
+counts.lam.downsample.rds <- file.path(output.dir, "counts_lam_downsample.rds")
+saveRDS(counts.lam.downsample, counts.lam.downsample.rds)
+
+counts.dam.downsample.rds <- file.path(output.dir, "counts_dam_downsample.rds")
+saveRDS(counts.dam.downsample, counts.dam.downsample.rds)
+
+```
+
+### 3. Calculate ACF in different bin sizes
+
+Next, I will count the data in different bin sizes and normalize the data
+over Dam. 
+
+```{r calculate ACF values, cache = T}
+
+# Loop over bin sizes, every time normalizing and calculate acf value
+bin.sizes <- c(1e3, 2e3, 5e3, 
+               1e4, 2e4, 5e4, 
+               1e5, 2e5, 5e5, 
+               1e6)
+chromosomes <- c("chr1")
+#bin.sizes <- c(1e5, 2e5, 5e5, 1e6)
+
+tib.acf <- tibble()
+bins.lam.list <- list()
+bins.dam.list <- list()
+
+for (bin in bin.sizes) {
+  
+  cat("Processing bin size:", bin, "bps\n")
+  
+  bins <- CreateBins(gatc.fragments, bin = bin, chromosomes = chromosomes)
+  
+  # Use the biggest bin size possible
+  bins.before <- bin %/% bin.sizes > 1 & bin %% bin.sizes == 0
+  
+  if (any(bins.before)) {
+    bin.previous <- as.character(tail(bin.sizes[bins.before], n = 1))
+    cat("   Using previous bin size:", bin.previous, "bps\n")
+    
+    bins.lam <- CountInBins(bins, bins.lam.list[[bin.previous]], 
+                            as_tibble(mcols(bins.lam.list[[bin.previous]])) %>%
+                              rename_at(vars(names(.)), ~ metadata.downsample$sample))
+    bins.dam <- CountInBins(bins, bins.dam.list[[bin.previous]], 
+                            as_tibble(mcols(bins.dam.list[[bin.previous]])) %>%
+                              rename_at(vars(names(.)), ~ metadata.downsample$sample))
+  } else {
+    cat("   Using GATC fragments\n")
+    
+    bins.dam <- CountInBins(bins, gatc.fragments, counts.dam.downsample)
+    bins.lam <- CountInBins(bins, gatc.fragments, counts.lam.downsample)
+  }
+  
+  bins.lam.list[[as.character(bin)]] <- bins.lam
+  bins.dam.list[[as.character(bin)]] <- bins.dam
+  
+  bins.norm <- NormDam(bins.lam, 
+                       as_tibble(mcols(bins.lam)),
+                       as_tibble(mcols(bins.dam)))
+  
+  bins.acf <- CalculateACF(bins.norm, bin = bin)
+  tib.acf <- bind_rows(tib.acf, bins.acf)
+}
+
+```
+
+```{r plot acf values, fig.width = 12, fig.height = 4}
+
+# Process acf tibble
+idx <- match(tib.acf$sample, metadata$sample)
+
+tib.acf <- tib.acf %>% 
+  mutate(class = metadata$class[idx],
+         cell = metadata$cell[idx],
+         target = metadata$target[idx])
+
+# Save rds values
+saveRDS(tib.acf, file.path(output.dir, "tib_ACF.rds"))
+saveRDS(bins.lam.list, file.path(output.dir, "bins_lam_list.rds"))
+saveRDS(bins.dam.list, file.path(output.dir, "bins_dam_list.rds"))
+
+# Plot
+tib.acf %>%
+  ggplot(aes(x = bin / 1e3, y = acf, col = class, shape = target)) +
+    geom_hline(yintercept = 1, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 20, col = "red", linetype = "dashed") +
+    geom_point(size = 2.5) +
+    facet_grid(. ~ cell) +
+    coord_cartesian(ylim = c(min(tib.acf$acf), 1)) +
+    xlab("bin size (kb)") +
+    ylab("ACF") +
+    scale_x_log10() +
+    scale_color_brewer(palette = "Set2") +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          legend.position="bottom")
+
+```
+
+
+### 4. Downsampling versus ACF
+
+To show that more reads result in a higher "useful resolution", also do
+some downsampling. Use K562 r1 LMNB1, which has most reads I believe.
+
+```{r downsampling of one sample, cache = T}
+
+# Prepare sample & parameters
+metadata.downsample <- metadata
+
+sample <- "K562_r1_LMNB1"
+i <- which(names(counts.lam) == sample)
+
+reads.counts <- c(1e7, 
+                  5e6, 2e6, 1e6,
+                  5e5, 2e5, 1e5,
+                  5e4)
+chromosomes <- c("chr1")
+
+
+# Downsamping
+counts.lam.sample.downsample <- do.call(cbind,
+                                        lapply(reads.counts,
+                                               function(x) {
+                                                 DownSampling(i, counts.lam, x)
+                                               }))
+counts.lam.sample.downsample <- as_tibble(counts.lam.sample.downsample, 
+                                          .name_repair = ~ as.character(reads.counts))
+
+counts.dam.sample.downsample <- do.call(cbind,
+                                        lapply(reads.counts,
+                                               function(x) {
+                                                 DownSampling(i, counts.dam, x)
+                                               }))
+counts.dam.sample.downsample <- as_tibble(counts.dam.sample.downsample, 
+                                          .name_repair = ~ as.character(reads.counts))
+
+
+# Calculate ACF
+tib.acf <- tibble()
+bin.sizes <- c(1e3, 5e3, 1e4, 2e4)
+
+for (bin in bin.sizes) {
+  
+  print(bin)
+  
+  # 1) Create bins
+  bins <- CreateBins(gatc.fragments, bin = bin, chromosomes = chromosomes)
+  # 2) Count in bins
+  bins.dam <- CountInBins(bins, gatc.fragments, counts.dam.sample.downsample)  
+  bins.lam <- CountInBins(bins, gatc.fragments, counts.lam.sample.downsample)
+  # 3) Normalize
+  bins.norm <- NormDam(bins.lam, 
+                       as_tibble(mcols(bins.lam)),
+                       as_tibble(mcols(bins.dam)))
+  # 4) Calculate ACF
+  bins.acf <- CalculateACF(bins.norm, bin = bin)
+  tib.acf <- bind_rows(tib.acf, bins.acf)
+  
+}
+
+```
+
+```{r plot the downsampling results, fig.width = 5, fig.height = 3.5}
+
+# Plot the results
+tib.acf <- tib.acf %>%
+  mutate(downsample = as.numeric(sample),
+         bin = factor(bin / 1e3))
+
+# Plot
+tib.acf %>%
+  ggplot(aes(x = downsample / 1e6, y = acf, col = bin)) +
+    geom_hline(yintercept = 1, col = "black", linetype = "dashed") +
+    geom_vline(xintercept = 5, col = "red", linetype = "dashed") +
+    #geom_vline(xintercept = nrow(counts.lam) / 1e6,
+    #           col = "green", linetype = "dashed") +
+    geom_point() +
+    coord_cartesian(ylim = c(min(tib.acf$acf), 1)) +
+    #facet_grid(. ~ bin / 1e3) +
+    scale_color_grey(name = "Bin size (kb)") +
+    xlab("Reads (M)") +
+    ylab("ACF") +
+    scale_x_log10() +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+
+```
+
+
+
+### Conclusion
+
+
+
+
+### SessionInfo
+
+```{r sessioninfo}
+
+sessionInfo()
+
+```

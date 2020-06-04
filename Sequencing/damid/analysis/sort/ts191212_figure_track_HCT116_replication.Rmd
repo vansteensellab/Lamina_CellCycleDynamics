@@ -1,0 +1,298 @@
+---
+title: "Normalization figure"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+This document will make the normalization figure.
+
+
+### Method
+
+Simple base-R plotting. Data to plot (HCT116) :
+
+  * RepliSeq
+  * G1
+  * S
+  * G2
+  
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressMessages(suppressWarnings(library(GenomicRanges)))
+suppressMessages(suppressWarnings(library(rtracklayer)))
+suppressMessages(suppressWarnings(library(ggplot2)))
+suppressMessages(suppressWarnings(library(reshape2)))
+suppressMessages(suppressWarnings(library(RColorBrewer)))
+suppressMessages(suppressWarnings(library(caTools)))
+
+
+# 
+# Prepare output
+output_dir <- "ts191212_figure_track_HCT116_replication"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Load the data sets required
+file_names <- c("g1", "s", "g2", "repliseq")
+
+repliseq <- import("ts190731_4DN_RepliSeq/bigwigs/HCT116_combined_20kb.bw")
+g1 <- import("results/tracks/normalized/bin-20kb/pADamID-HCT116_G1_LMNB2-20kb-combined.bw")
+s <- import("results/tracks/normalized/bin-20kb/pADamID-HCT116_S_LMNB2-20kb-combined.bw")
+g2 <- import("results/tracks/normalized/bin-20kb/pADamID-HCT116_G2_LMNB2-20kb-combined.bw")
+
+data_tracks <- list(g1, s, g2, repliseq)
+names(data_tracks) <- file_names
+
+# Let's combine the various bigwig files into one
+# First, create a GRanges with all the bins
+bins <- read.table("../ts180813_GCF5083_pADamIDtests/results/counts/bin-20kb/DamID-Hap1_r1_Dam-20kb.counts.txt.gz",
+                   sep = "\t")[, 1:3]
+names(bins) <- c("seqnames", "start", "end")
+bins$start <- bins$start + 1
+bins <- as(bins, "GRanges")
+
+# Add the data
+mcols(bins)[, file_names] <- NA 
+
+for (i in file_names) {
+  track <- data_tracks[[i]]
+  ovl <- findOverlaps(track, bins)
+  if (! i == "repliseq") {
+    mcols(bins)[subjectHits(ovl), i] <- scale(track$score[queryHits(ovl)])
+  } else {
+    mcols(bins)[subjectHits(ovl), i] <- track$score[queryHits(ovl)]
+  }
+}
+
+SmoothData <- function(data, size = 2e5) {
+  
+  # Convert to df
+  df <- as(mcols(data), "data.frame")
+  
+  # Smooth
+  n_bins <- floor(size / width(data[1]))
+  df.new <- c()
+  
+  for (chr in seqlevels(data)) {
+    idx <- which(as.character(seqnames(data)) == chr)
+    x <- as(mcols(data)[idx, ], "data.frame")
+    x.mean <- data.frame(do.call(cbind,
+                                 lapply(1:ncol(x), function(i) runmean(x[, i], n_bins))))
+    df.new <- rbind(df.new, x.mean)
+  }
+  
+  names(df.new) <- names(df)
+  
+  # Replace the old mcols
+  mcols(data) <- df.new
+  
+  data
+  
+}
+
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+
+### 1) Plot
+
+Plot a particular example region.
+
+```{r plot, fig.width = 6, fig.height = 4.5}
+
+PlotDataTracks <- function(bins, chr = "chr1", start = 1, end = 1e6) {
+  
+  # Get the data
+  data <- bins[seqnames(bins) == chr & 
+                 start(bins) >= start & 
+                 end(bins) <= end]
+  
+  data <- as(data, "data.frame")
+  
+  # Melt the data
+  data.melt <- melt(data, id.vars = c("seqnames", "start", "end", "width", "strand"))
+  data.melt <- data.melt[complete.cases(data.melt), ]
+  
+  # I want a dummy to keep G1 -> G2 to same, while given RepliSeq freedom for the range
+  limits <- range(data.melt$value[data.melt$variable != "repliseq"])
+  dummy <- data.frame(xmin = data.melt$start[1], xmax = data.melt$end[1],
+                      ymin = limits[1], ymax = limits[2],
+                      variable = factor(c("g1", "s", "g2"),
+                                        levels = levels(data.melt$variable)))
+  
+  
+  # Plot the data
+  plt <- ggplot(data.melt, aes(xmin = start / 1e6, xmax = end / 1e6, ymin = 0, ymax = value,
+                               fill = variable)) +
+    geom_rect() +
+    geom_hline(yintercept = 0, size = 0.5) +
+    facet_grid(variable ~ ., scales = "free_y") +
+    geom_blank(data = dummy, aes(ymin = ymin, ymax = ymax)) +
+    #facet_grid(variable ~ .) +
+    xlab(paste0(chr, " (Mb)")) +
+    ylab("Score") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_brewer(palette = "Set1", guide = FALSE) +
+    theme_classic()
+  
+  plot(plt)
+  
+}
+
+PlotDataTracks(bins, 
+               chr = "chr2", start = 149e6, end = 173e6)
+
+PlotDataTracks(bins, 
+               chr = "chr1", start = 52e6, end = 70e6)
+
+PlotDataTracks(bins, 
+               chr = "chr5", start = 129e6, end = 156e6)
+
+PlotDataTracks(bins, 
+               chr = "chr9", start = 86e6, end = 102e6)
+
+PlotDataTracks(bins, 
+               chr = "chr10", start = 73e6, end = 81e6)
+
+PlotDataTracks(bins, 
+               chr = "chr11", start = 0e6, end = 25e6)
+
+```
+
+
+```{r generate difference tracks, fig.width = 6, fig.height = 4}
+
+PlotDataTracks <- function(bins, chr = "chr1", start = 1, end = 1e6, ylim = NULL) {
+  
+  # Get the data
+  data <- bins[seqnames(bins) == chr & 
+                 start(bins) >= start & 
+                 end(bins) <= end]
+  
+  data <- as(data, "data.frame")
+  
+  # Melt the data
+  data.melt <- melt(data, id.vars = c("seqnames", "start", "end", "width", "strand"))
+  data.melt <- data.melt[complete.cases(data.melt), ]
+  
+  data.melt$class <- "timepoints"
+  data.melt$class[data.melt$variable == "repliseq"] <- "repliseq"
+  data.melt$class <- factor(data.melt$class,
+                            levels = c("timepoints", "repliseq"))
+  
+  # # I want a dummy to keep G1 -> G2 to same, while given RepliSeq freedom for the range
+  # limits <- range(data.melt$value[data.melt$variable != "repliseq"])
+  # dummy <- data.frame(xmin = data.melt$start[1], xmax = data.melt$end[1],
+  #                     ymin = limits[1], ymax = limits[2],
+  #                     variable = factor(c("g1", "s", "g2"),
+  #                                       levels = levels(data.melt$variable)))
+  
+  
+  # Plot the data
+  plt <- ggplot(data.melt, aes(xmin = start / 1e6, xmax = end / 1e6, ymin = 0, ymax = value,
+                               fill = class)) +
+    geom_rect() +
+    geom_hline(yintercept = 0, size = 0.5) +
+    # facet_grid(variable ~ ., scales = "free_y") +
+    facet_grid(variable ~ .) +
+    # geom_blank(data = dummy, aes(ymin = ymin, ymax = ymax)) +
+    #facet_grid(variable ~ .) +
+    xlab(paste0(chr, " (Mb)")) +
+    ylab("Lamina contacts") +
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0)) +
+    scale_fill_manual(values = c("#7379B7", "#984EA3"), guide = FALSE) +
+    #scale_fill_grey(guide = FALSE) +
+    theme_classic()
+  
+  if (! is.null(ylim)) {
+    plt <- plt + coord_cartesian(ylim = ylim)
+  }
+  
+  plot(plt)
+  
+}
+
+# Get difference per bin
+bins_difference <- bins
+mcols(bins_difference) <- data.frame(s_g1 = bins$s - bins$g1,
+                                     s_g2 = bins$s - bins$g2,
+                                     g2_g1 = bins$g2 - bins$g1)
+
+PlotDataTracks(bins_difference, 
+               chr = "chr1", start = 52e6, end = 70e6, ylim = c(-2, 2))
+
+# Add smoothing, similar to analysis
+bins_difference <- SmoothData(bins_difference, size = 10e5)
+
+PlotDataTracks(bins_difference, 
+               chr = "chr1", start = 52e6, end = 70e6, ylim = c(-0.5, 0.5))
+
+
+
+
+PlotDataTracks(bins, 
+               chr = "chr1", start = 212e6, end = 223e6)
+
+PlotDataTracks(bins_difference, 
+               chr = "chr1", start = 212e6, end = 223e6, ylim = c(-0.5, 0.5))
+
+```
+
+### Conclusion
+
+I need to decide and change the colors. This might be easier in illustrator, so 
+I won't bother with it now.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

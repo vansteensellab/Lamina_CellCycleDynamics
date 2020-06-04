@@ -1,0 +1,1033 @@
+---
+title: "4DN DamID Gene expression remapped"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+Question: how does differential localization matches with gene expression?
+
+The ENCODE data sets only included H1, K562 and "foreskin fibroblast". To be
+able to use data from other cell types, I decided to download the reads and 
+process the files myself. (With help of Federico's pipeline.) In this way, I 
+was able to include other data sets as well.
+
+
+### Method
+
+ENCODE RNA-seq / CAGE .tsv expression tables.
+
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(RColorBrewer))
+
+
+
+# Load data from the previous module
+input_dir_scaling <- "ts180131_normalization"
+input_dir_regions <- "ts180131_differential_localization"
+
+samples.df <- readRDS(file.path(input_dir_scaling,
+                                "DamID_samples.rds"))
+
+# Only plot the combined data here for simplicity
+damid.combined <- readRDS(file.path(input_dir_scaling,
+                                  "DamID_GRanges_scaled_combined.rds"))
+damid.hmm <- readRDS(file.path(input_dir_scaling,
+                               "DamID_HMM.rds"))
+regions <- readRDS(file.path(input_dir_regions,
+                             "DamID_GRangesList_regionsCombined.rds"))
+
+regions.LADs <- readRDS(file.path(input_dir_regions,
+                             "DamID_GRangesList_regionsLADs.rds"))
+regions.NADs <- readRDS(file.path(input_dir_regions,
+                             "DamID_GRangesList_regionsNADs.rds"))
+
+# Set bin size
+bin_size <- "80kb"
+
+# Prepare output 
+output_dir <- "ts180405_GeneExpression_Remapped"
+dir.create(output_dir, showWarnings = FALSE)
+
+```
+
+
+### RNA-seq
+
+First, I need to load the RNA-seq data. I will load in ENCODE FPKM values and 
+the new gene counts from the pipeline. 
+
+```{r load rna-seq - old data, include = FALSE}
+
+# # Read in RNA-seq data sets, using FPKM values
+# cells <- c("HFF_not_hTERT", "K562_TomEditable", "H1")
+# rnaseq <- NULL
+# 
+# for (cell in cells) {
+#   
+#   # List all the files
+#   file.list <- dir(file.path("~/mydata/data/4DNucleome/GRCh38/ENCODE/",
+#                              cell,
+#                              "download"),
+#                    pattern = "tsv")
+#   
+#   # Filter for RNA-seq
+#   file.list <- grep("RNA", file.list, value = T)
+#   
+#   for (file in file.list) {
+#     x <- read.delim(file.path("~/mydata/data/4DNucleome/GRCh38/ENCODE/",
+#                               cell,
+#                               "download",
+#                               file),
+#                      header = T, stringsAsFactors = FALSE)
+#     
+#     if (ncol(x) == 15) {
+#       if (is.null(rnaseq)) {
+#         rnaseq <- x[, c("gene_id", "FPKM")]
+#         names(rnaseq)[2] <- paste0(cell, sub(".tsv", 
+#                                              "", 
+#                                              sub(".*r[1-2]", 
+#                                                  "", 
+#                                                  file)))
+#       } else {
+#         rnaseq <- cbind(rnaseq, x$FPKM)
+#         names(rnaseq)[ncol(rnaseq)] <- paste0(cell, sub(".tsv", 
+#                                                         "", 
+#                                                         sub(".*r[1-2]", 
+#                                                             "", 
+#                                                             file)))
+#       }
+#     }
+#   }
+#   
+# }
+# 
+# 
+# # Let's validate the data with PCA plots
+# # Prepare data 
+# rnaseq.tmp <- rnaseq[, 2:ncol(rnaseq)]
+# rnaseq.tmp <- rnaseq.tmp[rowSums(rnaseq.tmp) > 0, ]
+# 
+# # Compute PCA scores on centered log2 matrix
+# pca <- prcomp(t(log2(rnaseq.tmp + 1)),
+#               scale = F)
+# 
+# # List samples
+# samples.df <- data.frame(samples = names(rnaseq)[2:ncol(rnaseq)],
+#                          cell = sapply(names(rnaseq)[2:ncol(rnaseq)], function(i) strsplit(i, "_")[[1]][1]),
+#                          stringsAsFactors = FALSE)
+# samples.df$cell <- factor(samples.df$cell)
+# 
+# # List variance explained
+# eigen <- pca$sdev^2
+# variance_explained <- round(eigen / sum(eigen), 2)
+# 
+# # Make plot
+# plot(pca$x[, "PC1"],
+#      pca$x[, "PC2"],
+#      col = as.numeric(samples.df$cell), pch = 19,
+#      xlab = paste0("PC1: ", variance_explained[1]),
+#      ylab = paste0("PC2: ", variance_explained[2]),
+#      main = "PCA plot on RNA-seq samples")
+# legend("topright", pch = 19, col = 1:3, legend = c("H1", "HFF", "K562"))
+
+
+```
+
+Before working with the remapped data, I want to note that these are absolute 
+gene counts instead of FPKM values. Furthermore, currently I've treated all 
+samples as "unstranded" even though some clearly are stranded.
+
+```{r load rna-seq - new data}
+
+# Import the genes
+genes <- import.gff("ts180315_GeneExpression/gencode.v24.primary_assembly.annotation.gtf.gz")
+genes <- genes[mcols(genes)$type == "gene"]
+
+mcols(genes) <- mcols(genes)[, c("gene_id", "gene_name", "gene_type")]
+
+# Read in RNA-seq data sets, this is gene counts
+rnaseq_star.se <- read.delim("~/mydata/proj/3D_nucleus/data/external/ts180329_RNAseq_4DNcells/results_se/Star/count_table.tsv",
+                             header = T, stringsAsFactors = FALSE)
+
+rnaseq_star.pe <- read.delim("~/mydata/proj/3D_nucleus/data/external/ts180329_RNAseq_4DNcells/results_pe/Star/count_table.tsv",
+                             header = T, stringsAsFactors = FALSE)
+rnaseq_star.pe <- rnaseq_star.pe[, grep("\\.1$", names(rnaseq_star.pe), invert = T)]
+
+rnaseq_star <- cbind(rnaseq_star.se, rnaseq_star.pe[2:ncol(rnaseq_star.pe)])
+
+row.names(rnaseq_star) <- rnaseq_star$sample.id
+rnaseq_star <- rnaseq_star[, 2:ncol(rnaseq_star)]
+
+# Filter the worst samples
+to_filter <- c("ENCFF000DJL_H1.hESC_NoDepletion_NotStranded_PE_r1", 
+               "GSM1697490_WT..untreated_Hap1_NotDepleted_Stranded_PE")
+rnaseq_star <- rnaseq_star[, - which(names(rnaseq_star) %in% to_filter)]
+
+# Prepare a sample data frame
+cells <- c("H1", "K562", "GM12878", "Hap1", "KBM7", "HEPG2", "HCT116", "RPE", "IMR.90", "HFF")
+samples_star.df <- data.frame(samples = names(rnaseq_star),
+                              stringsAsFactors = FALSE)
+
+samples_star.df$cell <- ""
+for (cell in cells) {
+  samples_star.df$cell[grep(paste0("_", toupper(cell)), 
+                            toupper(samples_star.df$samples))] <- cell
+}
+
+samples_star.df$stranded <- ifelse(grepl("NotStranded", samples_star.df$samples),
+                                   "NotStranded", "Stranded")
+samples_star.df$rRNADepleted <- ifelse(grepl("NotDepleted", samples_star.df$samples),
+                                       "NotDepleted", "rDNADepleted")
+samples_star.df$encode <- ifelse(grepl("ENC", samples_star.df$samples),
+                                 "ENCODE", "NotENCODE")
+
+samples_star.df$cell <- factor(samples_star.df$cell, 
+                               levels = cells)
+
+
+# Filter for lincRNA and protein_coding genes only
+keep <- mcols(genes)$gene_type %in% c("protein_coding", "lincRNA")
+genes <- genes[keep]
+rnaseq_star <- rnaseq_star[keep, ]
+
+#genes <- genes[mcols(genes)$gene_type %in% c("protein_coding", "lincRNA")]
+#genes <- genes[mcols(genes)$gene_type %in% c("protein_coding")]
+
+
+# Load this into DESeq2
+rnaseq_dds <- DESeqDataSetFromMatrix(countData = rnaseq_star,
+                                     colData = samples_star.df,
+                                     design= ~ cell)
+rnaseq_dds <- DESeq(rnaseq_dds)
+
+# Get the "transformed" values and create PCA plot
+rnaseq_dds.vsd <- vst(rnaseq_dds, blind=FALSE)
+rnaseq_dds.vsd <- normTransform(rnaseq_dds, pc = 0.001)
+plotPCA(rnaseq_dds.vsd, intgroup=c("cell"))
+
+```
+
+Okay, now we have the RNAseq samples (gene counts) loaded the PCA plot confirms
+that the samples are not too bad. Note that you do have some strange outliers,
+but I don't know why and how right now.
+
+
+### Differential localization versus gene expression
+
+Time to start asking interesting questions:
+
+  * In the different cell types, what is the expression range within and
+    outside of associated domains (LADs / NADs)?
+  * In the different cell types, how is the expression range affected by the
+    differential localization calculated with the DamID data?
+
+Again, I need to prepare this by first matching the gene_ids to genomic 
+locations.
+    
+```{r rnaseq to GR, include = FALSE}
+
+# # First, I will create a per-cell mean score
+# rnaseq.mean <- data.frame(gene_id = rnaseq[, 1],
+#                           stringsAsFactors = FALSE)
+# rnaseq.mean <- cbind(rnaseq.mean, 
+#                      do.call(cbind, tapply(samples.df$samples,
+#                                            samples.df$cell,
+#                                            function(x) rowMeans(rnaseq[, x]))))
+# 
+# # Next, I need to link this to the genomic locations. 
+# genes <- import.gff("ts180315_GeneExpression/gencode.v24.primary_assembly.annotation.gtf.gz")
+# genes <- genes[mcols(genes)$type == "gene"]
+# 
+# # Filter for lincRNA and protein_coding genes only
+# genes <- genes[mcols(genes)$gene_type %in% c("protein_coding", "lincRNA")]
+# genes <- genes[mcols(genes)$gene_type %in% c("protein_coding")]
+# 
+# idx <- match(rnaseq.mean$gene_id, mcols(genes)$gene_id)
+# idx.filter <- idx[!is.na(idx)]
+# 
+# rnaseq.mean <- rnaseq.mean[which(! is.na(idx)), ]
+# rnaseq.mean$seqnames <- as.character(seqnames(genes)[idx.filter])
+# rnaseq.mean$start <- start(genes)[idx.filter]
+# rnaseq.mean$end <- end(genes)[idx.filter]
+# rnaseq.mean$strand <- as.character(strand(genes)[idx.filter])
+# 
+# rnaseq.mean$gene_name <- mcols(genes)$gene_name[idx.filter]
+# 
+# rnaseq.mean <- as(rnaseq.mean, "GRanges")
+# rnaseq.mean <- sort(rnaseq.mean)
+
+
+```
+
+```{r rnaseq star to GR}
+
+# First, I will create a per-cell mean score
+rnaseq_dds.assay <- data.frame(assay(rnaseq_dds.vsd))
+
+rnaseq_dds.assay.mean <- data.frame(ensembl = row.names(rnaseq_dds.assay))
+rnaseq_dds.assay.mean <- cbind(rnaseq_dds.assay.mean,
+                               do.call(cbind, tapply(samples_star.df$samples,
+                                                     samples_star.df$cell,
+                                                     function(x) {
+                                                       if (length(x) > 1) {
+                                                         rowMeans(rnaseq_dds.assay[, x]) 
+                                                       } else {
+                                                         rnaseq_dds.assay[, x]
+                                                       }})))
+
+
+
+# Add the rnaseq scores
+mcols(genes) <- cbind(mcols(genes), rnaseq_dds.assay.mean)
+
+```
+
+So, we have:
+
+  * GRanges of the regions (LADs / NADs) and their preferential localization.
+  * GRanges of the genes and their expression in the various cell lines.
+  
+Next, I want to look at the expression ranges of the genes within the 
+compartments, and how this changes with the differential localization.
+
+```{r RNAseq in regions, fig.width = 6, fig.height = 4.5}
+
+# I want to link the RNAseq to the DamID scores
+# For now and for simplicity, I will simply use the TSS location to determine
+# the DamID bin to use.
+
+# For each cell type, add region information
+plotExpression <- function(rnaseq.mean, regions, cell, 
+                           ylim = NULL, gene_filter = NULL) {
+  
+  # Start with a fresh rnaseq object
+  rnaseq.cell <- rnaseq.mean
+  
+  # Filter for gene type if given
+  if (! is.null(gene_filter)) {
+    rnaseq.cell <- genes[mcols(genes)$gene_type %in% gene_filter]
+  }
+  
+  # Find overlaps
+  ovl <- findOverlaps(rnaseq.cell, regions[[cell]], type = "within")
+  
+  # Add region information
+  mcols(rnaseq.cell)$within_region <- FALSE
+  mcols(rnaseq.cell)$within_region[queryHits(ovl)] <- TRUE
+  
+  mcols(rnaseq.cell)$difference <- NA
+  mcols(rnaseq.cell)$difference[queryHits(ovl)] <- mcols(regions[[cell]])$difference[subjectHits(ovl)]
+  
+  mcols(rnaseq.cell)$differential <- "iLAD"
+  mcols(rnaseq.cell)$differential[queryHits(ovl)] <- mcols(regions[[cell]])$differential[subjectHits(ovl)]
+  mcols(rnaseq.cell)$differential[is.na(mcols(rnaseq.cell)$differential)] <- "-"
+  mcols(rnaseq.cell)$differential <- factor(mcols(rnaseq.cell)$differential, 
+                                            levels = c("4xAP3", "-", "LMNB1", "iLAD"))
+  
+  # Extract the mcols and plot
+  x <- as(mcols(rnaseq.cell), "data.frame")
+  x$cell <- x[, cell]
+  
+  #plt <- ggplot(x, aes(x = differential, y = log2(cell + pseudo), col = differential)) + 
+  plt <- ggplot(x, aes(x = differential, y = cell, col = differential)) + 
+    geom_quasirandom(alpha = 1) +
+    geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+    ggtitle(cell) + 
+    xlab("") +
+    ylab("rlog(expression)") +
+    theme_bw()
+  
+  if (! is.null(ylim)) {
+    plt <- plt + ylim(ylim[1], ylim[2])
+  }
+  
+  plt
+  
+}
+# For each cell type, add region information
+plotRegionsWithExpression <- function(rnaseq.mean, regions, cell, 
+                                      gene_filter = NULL, polygon = T) {
+  
+  # Start with a fresh rnaseq object
+  rnaseq.cell <- rnaseq.mean
+  
+  # Filter for gene type if given
+  if (! is.null(gene_filter)) {
+    rnaseq.cell <- genes[mcols(genes)$gene_type %in% gene_filter]
+  }
+  
+  # Find overlaps
+  ovl <- findOverlaps(rnaseq.cell, regions[[cell]], type = "within")
+  
+  # Add region information
+  mcols(rnaseq.cell)$within_region <- FALSE
+  mcols(rnaseq.cell)$within_region[queryHits(ovl)] <- TRUE
+  
+  mcols(rnaseq.cell)$difference <- NA
+  mcols(rnaseq.cell)$difference[queryHits(ovl)] <- mcols(regions[[cell]])$difference[subjectHits(ovl)]
+  
+  mcols(rnaseq.cell)$differential <- "iLAD"
+  mcols(rnaseq.cell)$differential[queryHits(ovl)] <- mcols(regions[[cell]])$differential[subjectHits(ovl)]
+  mcols(rnaseq.cell)$differential[is.na(mcols(rnaseq.cell)$differential)] <- "-"
+  mcols(rnaseq.cell)$differential <- factor(mcols(rnaseq.cell)$differential, 
+                                            levels = c("4xAP3", "-", "LMNB1", "iLAD"))
+  
+  mcols(rnaseq.cell)$cell_LMNB1 <- NA
+  mcols(rnaseq.cell)$cell_LMNB1[queryHits(ovl)] <- mcols(regions[[cell]])[, paste0(cell, "_LMNB1")][subjectHits(ovl)]
+  
+  mcols(rnaseq.cell)$cell_4xAP3 <- NA
+  mcols(rnaseq.cell)$cell_4xAP3[queryHits(ovl)] <- mcols(regions[[cell]])[, paste0(cell, "_4xAP3")][subjectHits(ovl)]
+  
+  # Extract the mcols and plot
+  x <- as(mcols(rnaseq.cell), "data.frame")
+  x$cell <- x[, cell]
+  
+  # Plot
+  limits <- c(min(rnaseq.cell$cell_LMNB1, rnaseq.cell$cell_4xAP3, na.rm = T),
+              max(rnaseq.cell$cell_LMNB1, rnaseq.cell$cell_4xAP3, na.rm = T))
+  
+  if (polygon) {
+    min.score <- 0.5
+    min.difference <- 0.25
+    
+    polygon.LAD <- data.frame(x = c(min.score, min.score, limits[2], limits[2]),
+                              y = c(limits[1], 0 + min.score - min.difference, limits[2] - min.difference, limits[1]))
+    polygon.NAD <- data.frame(x = c(limits[1], 0 + min.score - min.difference, limits[2] - min.difference, limits[1]),
+                              y = c(min.score, min.score, limits[2], limits[2]))
+  }
+  
+  plt <- ggplot(x, aes(x = cell_LMNB1, y = cell_4xAP3, col = cell)) + 
+    geom_abline(lty = 2)
+  
+  if (polygon) {
+    plt <- plt + 
+      geom_polygon(data = polygon.LAD, aes(x = x, y = y), col = NA, fill = "blue", alpha = 0.1) +
+      geom_polygon(data = polygon.NAD, aes(x = x, y = y), col = NA, fill = "green", alpha = 0.1)
+  }
+  
+  plt <- plt +
+    geom_jitter(alpha = 1, size = 0.8, width = 0.05, height = 0.05) +
+    ggtitle(cell) + 
+    xlab("LMNB1") +
+    ylab("4xAP3") +
+    xlim(limits) + ylim(limits) +
+    # scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = 0) +
+    scale_colour_gradientn(colors = colorRamps::matlab.like(9)[c(1:4, 6:9)]) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plt
+  
+}
+plotDamIDWithExpression <- function(rnaseq.mean, damid.combined, cell, 
+                                    gene_filter = NULL, alpha = 1, size = 0.5,
+                                    polygon = T) {
+  
+  # Start with a fresh rnaseq object
+  rnaseq.cell <- rnaseq.mean
+  
+  # Filter for gene type if given
+  if (! is.null(gene_filter)) {
+    rnaseq.cell <- genes[mcols(genes)$gene_type %in% gene_filter]
+  }
+  
+  # Find overlaps
+  tss <- rnaseq.cell
+  start(tss) <- end(tss) <- ifelse(strand(rnaseq.cell) == "+",
+                                   start(tss), end(tss))
+  
+  # ovl <- findOverlaps(rnaseq.cell, damid.combined, type = "within")
+  ovl <- findOverlaps(tss, damid.combined, type = "within")
+  
+  # Add region information
+  mcols(rnaseq.cell)$cell_LMNB1 <- NA
+  mcols(rnaseq.cell)$cell_LMNB1[queryHits(ovl)] <- mcols(damid.combined)[, paste0(cell, "_LMNB1")][subjectHits(ovl)]
+  
+  mcols(rnaseq.cell)$cell_4xAP3 <- NA
+  mcols(rnaseq.cell)$cell_4xAP3[queryHits(ovl)] <- mcols(damid.combined)[, paste0(cell, "_4xAP3")][subjectHits(ovl)]
+  
+  # Extract the mcols and plot
+  x <- as(mcols(rnaseq.cell), "data.frame")
+  x$cell <- x[, cell]
+  
+  # Plot
+  limits <- c(min(rnaseq.cell$cell_LMNB1, rnaseq.cell$cell_4xAP3, na.rm = T),
+              max(rnaseq.cell$cell_LMNB1, rnaseq.cell$cell_4xAP3, na.rm = T))
+  
+  if (polygon) {
+    min.score <- 0.5
+    min.difference <- 0.25
+    
+    polygon.LAD <- data.frame(x = c(min.score, min.score, limits[2], limits[2]),
+                              y = c(limits[1], 0 + min.score - min.difference, limits[2] - min.difference, limits[1]))
+    polygon.NAD <- data.frame(x = c(limits[1], 0 + min.score - min.difference, limits[2] - min.difference, limits[1]),
+                              y = c(min.score, min.score, limits[2], limits[2]))
+  }
+  
+  
+  plt <- ggplot(x, aes(x = cell_LMNB1, y = cell_4xAP3, col = cell)) + 
+    geom_abline(lty = 2)
+  
+  if (polygon) {
+    plt <- plt + 
+      geom_polygon(data = polygon.LAD, aes(x = x, y = y), col = NA, fill = "blue", alpha = 0.1) +
+      geom_polygon(data = polygon.NAD, aes(x = x, y = y), col = NA, fill = "green", alpha = 0.1)
+  }
+  
+  plt <- plt +
+    geom_point(alpha = alpha, size = size) +
+    ggtitle(cell) + 
+    xlab("LMNB1") +
+    ylab("4xAP3") +
+    xlim(limits) + ylim(limits) +
+    # scale_color_gradient2(low = "blue", mid = "grey", high = "red", midpoint = 0) +
+    scale_colour_gradientn(colors = colorRamps::matlab.like(9)[c(1:4, 6:9)]) +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+  
+  plt
+  
+}
+
+
+cell <- "H1"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+cell <- "K562"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+cell <- "Hap1"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+cell <- "HCT116"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+cell <- "RPE"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+cell <- "HFF"
+plotExpression(genes, regions, cell)
+plotExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotRegionsWithExpression(genes, regions, cell, gene_filter = "protein_coding")
+plotDamIDWithExpression(genes, damid.combined, cell, gene_filter = "protein_coding")
+
+
+```
+
+
+Well, that's something. Based on the RNA-seq data, it almost seems as if the 
+nucleolus is the more repressive compartment. Or, to put it differently, 
+preferential localization as I determine it is a better predictor of gene
+repression for the nucleolus than for the lamina. Overall, you do see the
+expected drop from "NA" (= iLADs) into the regions. Interestingly, I keep seeing
+that nucleolus is lower. Even though these regions are almost completely 
+mirrors between H1/K562 and HFF.
+
+Note that this is only with protein-coding genes! When including more things, as
+lincRNAs, I realized that the numbers of 0s became (too) high.
+
+
+### Scatterplots
+
+Until now, I've only been showing the data based on the binary division. What
+happens when I make a scatterplot of the difference vs expression levels?
+
+```{r rna-seq scatterplots, include = FALSE}
+# 
+# # For each cell type, add region information
+# plotExpressionScatter <- function(rnaseq.mean, regions, cell, pseudo = 0.01, 
+#                                   ylim = NULL, gene_filter = NULL) {
+#   
+#   # Start with a fresh rnaseq object
+#   rnaseq.cell <- rnaseq.mean
+#   
+#   # Filter for gene type if given
+#   if (! is.null(gene_filter)) {
+#     rnaseq.cell <- genes[mcols(genes)$gene_type %in% gene_filter]
+#   }
+#   
+#   # Find overlaps
+#   ovl <- findOverlaps(rnaseq.cell, regions[[cell]])
+#   
+#   # Add region information
+#   mcols(rnaseq.cell)$within_region <- FALSE
+#   mcols(rnaseq.cell)$within_region[queryHits(ovl)] <- TRUE
+#   
+#   mcols(rnaseq.cell)$difference <- NA
+#   mcols(rnaseq.cell)$difference[queryHits(ovl)] <- mcols(regions[[cell]])$difference[subjectHits(ovl)]
+#   
+#   mcols(rnaseq.cell)$differential <- "iLAD"
+#   mcols(rnaseq.cell)$differential[queryHits(ovl)] <- mcols(regions[[cell]])$differential[subjectHits(ovl)]
+#   mcols(rnaseq.cell)$differential[is.na(mcols(rnaseq.cell)$differential)] <- "-"
+#   mcols(rnaseq.cell)$differential <- factor(mcols(rnaseq.cell)$differential, 
+#                                             levels = c("4xAP3", "-", "LMNB1", "iLAD"))
+#   
+#   # Extract the mcols and plot
+#   x <- as(mcols(rnaseq.cell), "data.frame")
+#   x$cell <- x[, cell]
+# 
+#   # plt <- ggplot(x, aes(x = differential, y = log2(cell + pseudo), col = differential)) +
+#   #   geom_quasirandom(alpha = 0.1) +
+#   #   geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+#   #   ggtitle(cell) +
+#   #   xlab("") +
+#   #   ylab(paste0("log2(expression + ", pseudo, ")")) +
+#   #   theme_bw()
+#   # 
+#   # if (! is.null(ylim)) {
+#   #   plt <- plt + ylim(ylim[1], ylim[2])
+#   # }
+#   # 
+#   # plt
+#   
+#   
+#   
+#   #plt2 <- ggplot(x, aes(x = difference, y = log2(cell + pseudo))) +
+#   plt2 <- ggplot(x, aes(x = difference, y = cell)) +
+#     geom_point(alpha = 0.2) +
+#     #geom_smooth(method = 'lm', formula = y~x) +
+#     geom_smooth(method = 'loess', col = "red") +
+#     ggtitle(cell) + 
+#     xlab("Differential localization") +
+#     ylab(paste0("log2(expression + ", pseudo, ")")) +
+#     theme_bw()
+#   
+#   if (! is.null(ylim)) {
+#     plt2 <- plt2 + ylim(ylim[1], ylim[2])
+#   }
+#   
+#   plt2
+#   
+# }
+# 
+# 
+# 
+# plotExpressionScatter(rnaseq.mean, regions, "H1", gene_filter = "protein_coding")
+# 
+# plotExpressionScatter(rnaseq.mean, regions, "K562", gene_filter = "protein_coding")
+# 
+# plotExpressionScatter(rnaseq.mean, regions, "Hap1", gene_filter = "protein_coding")
+# 
+# plotExpressionScatter(rnaseq.mean, regions, "HCT116", gene_filter = "protein_coding")
+# 
+# plotExpressionScatter(rnaseq.mean, regions, "RPE", gene_filter = "protein_coding")
+
+
+
+```
+
+
+
+### Using actual DamID scores per gene
+
+A big problem I've realized with this work is that the regions are very large
+and imprecise. In other words, many of the genes still expressed are often
+near borders or other regions with very low DamID signal. Indicating that these
+genes are not so much near the compartment in the first place.
+
+A better solution is to use the actual DamID data. When I calculate the mean
+interaction score for each gene instead of using the region score, it should 
+give insight to which extend this gene is "within" the compartment.
+
+```{r filtered plots, fig.width = 5, fig.height = 4.5, include = FALSE} 
+# 
+# # Let's just add the DamID scores to the rnaseq data
+# ovl <- findOverlaps(rnaseq.mean, damid.combined)
+# 
+# rnaseq.mean <- rnaseq.mean[unique(queryHits(ovl))]
+# mcols(rnaseq.mean) <- cbind(mcols(rnaseq.mean), 
+#                             data.frame(do.call(rbind, 
+#                                        tapply(subjectHits(ovl),
+#                                               queryHits(ovl),
+#                                               function(x) colMeans(as(mcols(damid.combined), "data.frame")[x, ])))))
+# 
+# 
+# ovl <- findOverlaps(cage.gene, damid.combined)
+# 
+# cage.gene <- cage.gene[unique(queryHits(ovl))]
+# mcols(cage.gene) <- cbind(mcols(cage.gene), 
+#                             data.frame(do.call(rbind, 
+#                                        tapply(subjectHits(ovl),
+#                                               queryHits(ovl),
+#                                               function(x) colMeans(as(mcols(damid.combined), "data.frame")[x, ])))))
+# 
+# # Let's do a scatter plot
+# plotExpressionFiltered <- function(rnaseq.mean, regions, cell, pseudo = 0.01, ylim = NULL) {
+#   
+#   # Start with a fresh rnaseq object
+#   rnaseq.cell <- rnaseq.mean
+#   
+#   # Find overlaps
+#   ovl <- findOverlaps(rnaseq.cell, regions[[cell]], type = "within")
+# 
+#   # Add region information
+#   mcols(rnaseq.cell)$within_region <- FALSE
+#   mcols(rnaseq.cell)$within_region[queryHits(ovl)] <- TRUE
+#   
+#   mcols(rnaseq.cell)$difference <- NA
+#   mcols(rnaseq.cell)$difference[queryHits(ovl)] <- mcols(regions[[cell]])$difference[subjectHits(ovl)]
+#   
+#   mcols(rnaseq.cell)$differential <- "iLAD"
+#   mcols(rnaseq.cell)$differential[queryHits(ovl)] <- mcols(regions[[cell]])$differential[subjectHits(ovl)]
+#   mcols(rnaseq.cell)$differential[is.na(mcols(rnaseq.cell)$differential)] <- "-"
+#   mcols(rnaseq.cell)$differential <- factor(mcols(rnaseq.cell)$differential, 
+#                                             levels = c("4xAP3", "-", "LMNB1", "iLAD"))
+#   
+#   # Extract the mcols and plot
+#   x <- as(mcols(rnaseq.cell), "data.frame")
+#   x$cell <- x[, cell]
+#   x$cell_LMNB1 <- x[, paste0(cell, "_LMNB1")]
+#   x$cell_4xAP3 <- x[, paste0(cell, "_4xAP3")]
+#   
+#   x.filter <- x[which(x$within_region == TRUE & (x$cell_LMNB1 > 0.25 | x$cell_4xAP3 > 0.25)), ]
+#   x.filter <- x.filter[which(! (x.filter$differential == "4xAP3" & x.filter$cell_4xAP3 < 0.25)), ]
+#   x.filter <- x.filter[which(! (x.filter$differential == "LMNB1" & x.filter$cell_LMNB1 < 0.25)), ]
+#   x.filter <- x.filter[which(! (x.filter$differential == "-" & (x.filter$cell_4xAP3 < 0.25 & x.filter$cell_LMNB1 < 0.25))), ]
+#   # x.filter$differential <- factor(x.filter$differential, 
+#   #                                 levels = c("4xAP3", "-", "LMNB1"))
+# 
+#   plt <- ggplot(x.filter, 
+#                 aes(x = differential, y = log2(cell + pseudo), col = differential)) +
+#     geom_quasirandom(alpha = 1) +
+#     geom_boxplot(col = "black", outlier.shape = NA, fill = NA) +
+#     ggtitle(cell) +
+#     xlab("") +
+#     ylab(paste0("log2(expression + ", pseudo, ")")) +
+#     theme_bw()
+# 
+#   if (! is.null(ylim)) {
+#     plt <- plt + ylim(ylim[1], ylim[2])
+#   }
+# 
+#   plt
+#   
+#   
+#   
+#   # plt2 <- ggplot(x.filter, aes(x = difference, y = log2(cell + pseudo))) +
+#   #   geom_point(alpha = 0.2) +
+#   #   #geom_smooth(method = 'lm', formula = y~x) +
+#   #   geom_smooth(method = 'loess', col = "red") +
+#   #   ggtitle(cell) + 
+#   #   xlab("Differential localization") +
+#   #   ylab(paste0("log2(expression + ", pseudo, ")")) +
+#   #   theme_bw()
+#   # 
+#   # if (! is.null(ylim)) {
+#   #   plt2 <- plt2 + ylim(ylim[1], ylim[2])
+#   # }
+#   # 
+#   # plt2
+#   
+# }
+# 
+# 
+# 
+# plotExpressionFiltered(rnaseq.mean, regions, "H1")
+# 
+# plotExpressionFiltered(rnaseq.mean, regions, "K562")
+# 
+# plotExpressionFiltered(rnaseq.mean, regions, "HFF")
+# 
+# 
+# 
+# plotExpressionFiltered(cage.gene, regions, "H1", pseudo = 1)
+# 
+# plotExpressionFiltered(cage.gene, regions, "K562", pseudo = 1)
+# 
+# plotExpressionFiltered(cage.gene, regions, "HFF", pseudo = 1)
+
+
+```
+
+
+
+### Candidate genes
+
+So far, I've looked at gene expression within the differential regions. To 
+understand the process of this differential localization and why HFF seems to
+be more heavily nucleolus and the other two more lamina, I can look at gene 
+expression as well. Several genes have already been implicated to cause a 
+similar effect during senescence. Can I also find the difference in expression
+here?
+
+```{r candidate genes, fig.width = 12, fig.height = 8}
+
+#cells <- c("H1", "K562", "GM12878", "Hap1", "KBM7", "HEPG2", "HCT116", "RPE", "IMR.90", "HFF")
+cells <- c("H1", "K562", "Hap1", "HCT116", "RPE", "HFF")
+
+candidate_genes <- c("LMNB1", "LMNB2", "LMNA", "LBR", "EHMT2", "EZH2", "EMD", "LEMD1", "LEMD2", "LEMD3", "TMPO", "ANKLE1", "ANKLE2",
+                     "HDAC3", "GCFC2", "SUN1", "SUN2", "BANF1", "BCLAF1", "MKL1", "CBX5", "CBX1", "CBX3")
+# candidate_genes <- c("SMC1A", "SMC2", "SMC3", "SMC4", "WAPL", "MED12", "CTCF")
+
+candidate_genes.df <- data.frame(gene_name = candidate_genes,
+                                 stringsAsFactors = FALSE)
+
+# Determinet the correct overlap
+idx <- match(candidate_genes.df$gene_name,
+             mcols(genes)$gene_name)
+
+candidate_genes.df$gene_id <- mcols(genes)$gene_id[idx]
+
+# Add the data
+candidate_genes.df <- cbind(candidate_genes.df, rnaseq_dds.assay[idx, ])
+
+# Melt the data
+candidate_genes.df.melt <- melt(candidate_genes.df, 
+                                id.vars = c("gene_id", "gene_name"))
+
+idx <- match(candidate_genes.df.melt$variable, samples_star.df$samples)
+
+candidate_genes.df.melt$gene_name <- factor(candidate_genes.df.melt$gene_name,
+                                            levels = candidate_genes)
+
+candidate_genes.df.melt$stranded <- as.character(samples_star.df$stranded[idx])
+
+candidate_genes.df.melt$rRNADepleted <- as.character(samples_star.df$rRNADepleted[idx])
+
+
+candidate_genes.df.melt$cell <- as.character(samples_star.df$cell[idx])
+candidate_genes.df.melt <- candidate_genes.df.melt[candidate_genes.df.melt$cell %in% cells, ]
+candidate_genes.df.melt$cell <- factor(candidate_genes.df.melt$cell, 
+                                       levels = cells)
+
+# Plot with ggplot
+ggplot(candidate_genes.df.melt, aes(x = cell, y = value, color = cell)) +
+  geom_quasirandom(aes(shape = stranded)) +
+  facet_wrap(~ gene_name, scales = "free_y") +
+  geom_boxplot(fill = NA, col = "black", size = 0.5, outlier.colour = NA) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+```
+
+This is just a quick selection of candidate genes. However, you can observe the
+expected: for the more differentiated or senescent cells, you have higher 
+expression of LMNA and lower expression of LMNB1, together with expression 
+differences in for example LBR and EHMT2. Now, to which extend can we explain
+the observed differences in localization with these expression differences?
+
+What I think I need to do:
+
+  * Measure expression levels of all cell types. HFF seems near the end-point of
+    differentiation with many LADs, H3K9me3 regions and a strong nucleolar 
+    signal. As you can see, this goes together with a low LMNB1 score and a high
+    LMNA score. Could it be that HCT116 and RPE are somehow intermediates with 
+    different balances of LMNB1 / LMNA and therefore explain the observed 
+    results?
+  * Reduce expression levels of certain candidates in Hap1 (LMNB1, EHMT2) and 
+    increase expression of others (LMNA), and see what happens.
+  * Possibly the same thing in HFF.
+
+In this way, by disturbing things one gene at a time, I hope to understand the
+differences in observed behaviour.
+
+
+### Gene expression for each chromosome
+
+The DamID data has shown that specific chromosomes have different lamina / 
+nucleolus balances, that vary per cell type. Overall, active chromosomes have
+been linked to the nuclear interior with inactive chromosomes near the lamina.
+Does this hold true here?
+
+```{r chromosome expression levels, fig.width = 12, fig.height = 8}
+
+# First, for all genes
+cells <- c("H1", "K562", "Hap1", "HCT116", "RPE", "HFF")
+genes.df <- as(genes, "data.frame")
+genes.df <- genes.df[genes.df$gene_type == "protein_coding", ]
+
+genes.df <- genes.df[, c("seqnames", cells)]
+genes.df <- genes.df[genes.df$seqnames %in% c(paste0("chr", 1:22), "chrX"), ]
+genes.df <- melt(genes.df, id.vars = "seqnames")
+
+ggplot(genes.df, aes(x = seqnames, y = value, col = variable)) +
+  #geom_violin() +
+  #geom_boxplot(outlier.shape = NA, width = 0.1, fill = NA) +
+  geom_quasirandom(size = 0.5) +
+  facet_grid(variable ~ .) +
+  xlab("") +
+  ylab("rlog(expression)") +
+  ggtitle("All genes") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Second, for LAD-genes
+cLADs <- intersect(regions[["H1"]], regions[["K562"]])
+cLADs <- intersect(cLADs, regions[["Hap1"]])
+cLADs <- intersect(cLADs, regions[["HCT116"]])
+cLADs <- intersect(cLADs, regions[["RPE"]])
+cLADs <- intersect(cLADs, regions[["HFF"]])
+
+genes.df.cLADs <- as(genes[overlapsAny(genes, cLADs)],
+                   "data.frame")
+
+genes.df.cLADs <- genes.df.cLADs[genes.df.cLADs$gene_type == "protein_coding", ]
+
+genes.df.cLADs <- genes.df.cLADs[, c("seqnames", cells)]
+genes.df.cLADs <- genes.df.cLADs[genes.df.cLADs$seqnames %in% c(paste0("chr", 1:22), "chrX"), ]
+genes.df.cLADs <- melt(genes.df.cLADs, id.vars = "seqnames")
+
+ggplot(genes.df.cLADs, aes(x = seqnames, y = value, col = variable)) +
+  #geom_violin() +
+  #geom_boxplot(outlier.shape = NA, width = 0.1, fill = NA) +
+  geom_quasirandom(size = 0.5) +
+  facet_grid(variable ~ .) +
+  xlab("") +
+  ylab("rlog(expression)") +
+  ggtitle("cLAD genes") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+### Expression bed files; and save expression matrix
+
+For visualization, I would like to have a bed file with expression score that 
+can be visualized easily in IGV.
+
+```{r expression bed files}
+
+# Prepare output
+bed_out <- file.path(output_dir, "expression_bed")
+dir.create(bed_out, showWarnings = FALSE)
+
+# Set seqinfo from genes object for later .bw files
+seqinfo <- read.table("~/mydata/data/genomes/GRCh38/hg38.chrom.sizes", sep = "\t")
+idx <- match(seqlevels(genes), seqinfo[, 1])
+seqlengths(genes) <- seqinfo[match(seqlevels(genes), seqinfo[, 1]), 2]
+
+# Only use the start of the gene for visualization and remove dupicates
+genes_start <- genes
+start(genes_start) <- end(genes_start) <- ifelse(strand(genes) == "+", start(genes), end(genes))
+genes_start <- genes_start[which(! duplicated(data.frame(seqnames(genes_start), start(genes_start))))]
+
+for (cell in cells) {
+  
+  genes_bed <- genes_start
+  
+  # Filter for protein-coding for now
+  genes_bed <- genes_bed[mcols(genes_bed)$gene_type == "protein_coding"]
+  
+  mcols(genes_bed) <- mcols(genes_bed)[, c(cell, "gene_name")]
+  names(mcols(genes_bed)) <- c("score", "gene_name")
+  
+  # Export as .bed
+  export.bed(genes_bed, file.path(bed_out,
+                                  paste0(cell, "_rlog.bed")))
+  export.bw(genes_bed, file.path(bed_out,
+                                 paste0(cell, "_rlog.bw")))
+  
+}
+
+# Save expression matrix
+saveRDS(genes, 
+        file.path(output_dir,
+                  "genes_expression.rds"))
+
+```
+
+
+```{r save FPKM values}
+
+# Finally, for other purposes, having FPKM scores is also convenient
+# To use this, I need to have the transcript length though. This is tricky, as
+# DESeq2 by default works on gene level, and has no information on transcripts.
+# In turn, this makes it difficult to determine which transcript length to use:
+# mean, maximum, median?
+# I will simply start with the mean, that should minimize too low estimations
+# of (long) genes
+
+# Call to determine gene length:
+#python /home/t.v.schaik/mydata/proj/sManzo_pADamID/ts190515_pADamID_RPE_Top1_DRB/bin/gtftools.py -l ts180405_GeneExpression_Remapped/gencode_v24_genelength.bed ts180315_GeneExpression/gencode.v24.primary_assembly.annotation.gtf
+genelength <- read.table("ts180405_GeneExpression_Remapped/gencode_v24_genelength.bed", 
+                         sep = "\t", header = T)
+
+genelength <- genelength[genelength$gene %in% genes$ensembl, ]
+
+
+# Filter the DESeq2 object for chromosomes
+rnaseq_dds.fpkm <- rnaseq_dds[genes$gene_id %in% genelength$gene]
+
+# Add genelength
+mcols(rnaseq_dds.fpkm)$basepairs <- genelength$mean
+
+# Get FPKM
+genes.fpkm <- fpkm(rnaseq_dds.fpkm)
+
+genes.fpkm.mean <- data.frame(ensembl = row.names(genes.fpkm))
+genes.fpkm.mean <- cbind(genes.fpkm.mean,
+                         do.call(cbind, tapply(samples_star.df$samples,
+                                               samples_star.df$cell,
+                                               function(x) {
+                                                 if (length(x) > 1) {
+                                                   rowMeans(genes.fpkm[, x]) 
+                                                 } else {
+                                                   genes.fpkm[, x]
+                                                 }})))
+
+# Save as RDS
+saveRDS(genes.fpkm.mean, 
+        file.path(output_dir,
+                  "genes_fpkm.rds"))
+
+```
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+
