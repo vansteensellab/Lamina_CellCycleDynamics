@@ -1,0 +1,192 @@
+---
+title: "pA-DamID LAD enrichment"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+### Introduction
+
+I have sequenced various pA-DamID experiments for which I also have microscopy
+data. Using the images, I determine the LAD enrichment for a number of cells 
+hoping that these numbers reflect the LAD enrichment / dynamic range / 
+signal-to-noise of the sequencing data. In other words, I hope to be able to 
+optimize pA-DamID with microscopy output.
+
+The question though, does this work? Here, I will determine the LAD enrichment
+for the various experiments and later compare these numbers with the 
+microscopy output.
+
+
+### Method
+
+I have already defined LADs of Hap1 cells. I will simply count reads in the LADs
+and determine the overall log2 enrichment.
+
+
+### Functions
+
+Supporting functions.
+
+```{r functions}
+
+ReadExperiments <- function(experiments, experiments_dir) {
+  # Create one GRanges objects from all the experiments
+  
+  # Create an empty GRanges 
+  gr <- import.bed(file.path(experiments_dir, experiments[1]))
+  mcols(gr) <- NULL
+  
+  # For every experiment, add a GRanges column
+  for (exp in experiments) {
+    exp_values <- read.table(file.path(experiments_dir, exp), sep = "\t")[, 4]
+    mcols(gr) <- cbind(mcols(gr), exp_values)
+  }
+  
+  # Rename the columns
+  names(mcols(gr)) <- gsub("-20kb.*", "", experiments)
+  
+  gr
+}
+
+CalculateEnrichment <- function(data, LADs) {
+  # For a each column in a (gr) data object, calculate the LAD enrichment
+  
+  # Find the overlap
+  lad.idx <- overlapsAny(data, LADs[which(mcols(LADs)$name == "AD")])
+  ilad.idx <- overlapsAny(data, LADs[which(mcols(LADs)$name == "iAD")])
+  
+  # Determine the sums
+  lad.sums <- colSums(as(mcols(data), "data.frame")[lad.idx, ])
+  ilad.sums <- colSums(as(mcols(data), "data.frame")[ilad.idx, ])
+  
+  # Calculate the ratios
+  lad_enrichment <- data.frame(lad = lad.sums,
+                               ilad = ilad.sums,
+                               ratio = log2(lad.sums / ilad.sums))
+  
+  lad_enrichment$samples <- row.names(lad_enrichment)
+  
+  lad_enrichment
+  
+}
+
+```
+
+### Set-up
+
+Set the parameters and list the data.
+
+```{r set-up}
+
+# Load dependencies
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(rtracklayer))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(reshape2))
+suppressPackageStartupMessages(library(ggbeeswarm))
+suppressPackageStartupMessages(library(RColorBrewer))
+
+
+# Load the LADs
+Hap1_LADs <- import.bed("~/mydata/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/HMM/bin-20kb/Hap1_LMNB1-20kb-combined_HMM.txt.gz")
+
+# List the pA-DamID experiments
+experiments_dir <- c("results/counts/bin-20kb/")
+experiments <- list.files(experiments_dir, pattern = "Hap1")
+
+# Read all pA-DamID files
+data <- ReadExperiments(experiments, experiments_dir)
+
+# Note: also add the DamID data sets
+data_damid <- ReadExperiments(experiments = c("Hap1_r1_Dam10_1-20kb.counts.txt.gz",
+                                              "Hap1_r1_LMNB1-20kb.counts.txt.gz",
+                                              "Hap1_r2_Dam10-20kb.counts.txt.gz",
+                                              "Hap1_r2_LMNB1-20kb.counts.txt.gz"),
+                              experiments_dir = "~/mydata/proj/3D_nucleus/results/ts180110_4DN_DataProcessing/results/counts/bin-20kb/")
+
+```
+
+### Calculate the LAD enrichment
+
+Index based on LAD overlap and determine the colSums.
+
+```{r LAD enrichment}
+
+# Calculate the enrichment
+lad_enrichment <- CalculateEnrichment(data, Hap1_LADs)
+lad_enrichment_damid <- CalculateEnrichment(data_damid, Hap1_LADs)
+
+```
+
+
+### Plot this
+
+```{r plotting}
+
+ggplot(lad_enrichment, aes(x = samples, y = ratio)) +
+  geom_bar(stat = "identity") +
+  xlab("") +
+  ylab("LAD enrichment (log2)") +
+  ggtitle("pA-DamID LAD enrichment") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(lad_enrichment_damid, aes(x = samples, y = ratio)) +
+  geom_bar(stat = "identity") +
+  xlab("") +
+  ylab("LAD enrichment (log2)") +
+  ggtitle("DamID LAD enrichment") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+ggplot(rbind(lad_enrichment, lad_enrichment_damid), 
+       aes(x = samples, y = ratio)) +
+  geom_bar(stat = "identity") +
+  xlab("") +
+  ylab("LAD enrichment (log2)") +
+  ggtitle("All DamID LAD enrichment") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+It seems that I am indeed getting different LAD enrichments. I should write down
+these numbers and compare them with the microscopy numbers. Also note that the 
+values are not the same as the regular DamID values.
+
+```{r write data}
+
+output_dir <- "ts190729_LADenrichment"
+dir.create(output_dir, showWarnings = FALSE)
+write.table(lad_enrichment, file.path(output_dir,
+                                      "lad_enrichment.txt"),
+            sep = "\t", col.names = T, row.names = F, quote = F)
+
+```
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
+
+
+
+
+
+
+
+

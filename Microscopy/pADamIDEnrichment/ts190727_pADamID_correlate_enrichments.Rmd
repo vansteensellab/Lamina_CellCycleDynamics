@@ -1,0 +1,195 @@
+---
+title: "pA-DamID correlate enrichment"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+I have determined LAD enrichment for several pA-DamID experiments using both
+microscopy and sequencing. The question now: how well do these values correlate?
+
+### Setup
+
+Load the required libraries.
+
+```{r setup}
+
+# Load libraries
+library(ggplot2)
+library(reshape2)
+library(ggbeeswarm)
+library(RColorBrewer)
+
+```
+
+### Define functions
+
+Functions required for this document.
+
+```{r define functions}
+
+output_dir <- "ts190727_pADamID_correlate_enrichments"
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(fig.width = 10, fig.height = 4, 
+               dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+### Load data
+
+Read in the data.
+
+```{r load data}
+
+# Input directory for the files
+enrichment_microscope <- read.table("ts190729_all_enrichments_microscope.txt",
+                                    sep = "\t", header = T)
+enrichment_sequencing <- read.table("ts190729_LADenrichment/lad_enrichment.txt",
+                                    sep = "\t", header = T)
+
+```
+
+### Link data sets
+
+Unfortunately, the names do not really match between the experiments. I need
+to manually link them.
+
+```{r link data sets}
+
+enrichment_microscope$sequencing_name <- c("pADamID-Hap1_r2_LMNB1-rabbit",
+                                           "pADamID-Hap1_r2_LMNB2", 
+                                           "pADamID-Hap1_r2_LMNB2-no2ndrabbit",
+                                           NA,
+                                           "pADamID-Hap1_r2_NUP153",
+                                           "pADamID-Hap1_r2_pADam",
+                                           "pADamID-Hap1_r2_2ndrabbit-pADam",
+                                           NA,
+                                           "pADamID-Hap1_r1_LMNB1-BSA",
+                                           NA,
+                                           "pADamID-Hap1_r1_H3K27me3",
+                                           "pADamID-Hap1_r1_H3K9me2",
+                                           "pADamID-Hap1_r1_H3K9me3",
+                                           "pADamID-Hap1_r1_LMNB1-500d",
+                                           "pADamID-Hap1_r1_LMNB1-500d-pADam-500d",
+                                           "pADamID-Hap1_r1_Dam",
+                                           "pADamID-Hap1_r1_pADam",
+                                           NA,
+                                           "pADamID-Hap1_r1_LMNB1",
+                                           NA,
+                                           NA,
+                                           NA,
+                                           "pADamID-Hap1_r1_LMNB1-RT",
+                                           "pADamID-Hap1_r1_LMNB1-10m",
+                                           NA,
+                                           "pADamID-Hap1_r4_Dam_semibad-Dam",
+                                           "pADamID-Hap1_r4_H3K27me3",
+                                           "pADamID-Hap1_r4_H3K9me3",
+                                           "pADamID-Hap1_r4_LMNB1-100",
+                                           "pADamID-Hap1_r4_LMNB1-500",
+                                           "pADamID-Hap1_r4_LMNB2-100",
+                                           "pADamID-Hap1_r4_LMNB2-500",
+                                           "pADamID-Hap1_r4_NUP153",
+                                           "pADamID-Hap1_r4_pADam")
+
+enrichment_combined <- merge(enrichment_microscope, enrichment_sequencing,
+                             by.x = "sequencing_name", by.y = "samples", all = FALSE)
+
+# Subset different types of experiments
+enrichment_combined$group <- NA
+enrichment_combined$group[grep("_Dam", enrichment_combined$sequencing_name)] <- "Dam"
+enrichment_combined$group[grep("_pADam|2ndrabbit-pADam", enrichment_combined$sequencing_name)] <- "no-primary"
+enrichment_combined$group[grep("LMNB1", enrichment_combined$sequencing_name)] <- "Lamin B1"
+enrichment_combined$group[grep("LMNB2", enrichment_combined$sequencing_name)] <- "Lamin B2"
+#enrichment_combined$group[grep("NUP", enrichment_combined$sequencing_name)] <- "nuclear-pore"
+enrichment_combined$group[grep("H3K27", enrichment_combined$sequencing_name)] <- "H3K27me3"
+enrichment_combined$group[grep("H3K9me3", enrichment_combined$sequencing_name)] <- "H3K9me3"
+enrichment_combined$group[grep("LMNB2-no2ndrabbit", enrichment_combined$sequencing_name)] <- "no-bridging-antibody"
+enrichment_combined$group <- factor(enrichment_combined$group,
+                                    levels = c("Dam", "Lamin B1", "Lamin B2", "nuclear-pore", 
+                                               "H3K27me3", "H3K9me3", "no-primary",
+                                               "no-bridging-antibody"))
+
+```
+
+### Plot enrichment
+
+Finally, create a plot with enrichment scores. 
+
+```{r plot enrichment, fig.width = 5, fig.height = 3.5}
+
+enrichment_combined <- enrichment_combined[order(enrichment_combined$ratio, decreasing = T), ]
+enrichment_combined
+
+pearson <- round(cor(enrichment_combined$enrichment, enrichment_combined$ratio),
+                 digits = 2)
+limits <- range(c(enrichment_combined$enrichment, enrichment_combined$ratio))
+
+plt1 <- ggplot(enrichment_combined, aes(x = enrichment, y = ratio)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  ggtitle(paste("Correlate microscopy and sequencing - Pearson:", pearson)) +
+  xlab("Enrichment microscope") +
+  ylab("Enrichment sequencing") +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  theme_bw() +
+  coord_fixed()
+
+plt2 <- ggplot(enrichment_combined, aes(x = enrichment, y = ratio, label = sequencing_name)) +
+  geom_point() +
+  geom_text(aes(y = ratio + 0.1)) +
+  geom_smooth(method = "lm", se = FALSE) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  ggtitle(paste("Correlate microscopy and sequencing - Pearson:", pearson)) +
+  xlab("Enrichment microscope") +
+  ylab("Enrichment sequencing") +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  theme_bw() +
+  coord_fixed()
+
+plt3 <- ggplot(enrichment_combined, aes(x = enrichment, y = ratio)) +
+  geom_point(aes(col = group)) +
+  geom_smooth(method = "lm") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", col = "red") +
+  ggtitle(paste("Correlate microscopy and sequencing - Pearson:", pearson)) +
+  xlab("Enrichment microscope") +
+  ylab("Enrichment sequencing") +
+  xlim(limits[1], limits[2]) +
+  ylim(limits[1], limits[2]) +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw() +
+  coord_fixed()
+
+plot(plt1)
+plot(plt2)
+plot(plt3)
+
+pdf("ts181127_pADamID_correlate_enrichments.pdf", width = 6, height = 4)
+plot(plt3)
+dev.off()
+
+```
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+

@@ -1,0 +1,639 @@
+---
+title: "Radial intensity analysis"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+
+
+
+### Setup
+
+Load the required libraries.
+
+```{r setup}
+
+# Load libraries
+library(pixmap)   ## read.pnm(..)
+library(ggplot2)
+library(reshape2)
+library(ggbeeswarm)
+
+# Prepare output directory
+output_dir <- "ts190729_radial_intensity_analysis"
+dir.create(output_dir, showWarnings = FALSE)
+
+image_dir <- file.path(output_dir, "images")
+dir.create(image_dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+```{r functions}
+
+ReadPGNFromDF <- function(df, i, target) {
+  
+  # Get file name
+  f <- file.path(image.path,
+                 paste0(df$names[i], "_",
+                        target,
+                        ".pgm"))
+  
+  # Get image, only grey values
+  suppressWarnings(read.pnm(f)@grey*255)
+  
+}
+
+GetSignalPerLayer <- function(target, dist.factor, f = sum, q = 0.2) {
+      
+      # Get total signal per layer
+      pixellayer <- unlist(tapply(target, dist.factor, f, simplify=FALSE))
+      
+      # To normalize, subtract background & normalize to 0..1
+      d.zero <- quantile(pixellayer, q)
+      pixellayer.norm <- pixellayer - d.zero
+      pixellayer.norm <- pixellayer.norm / max(pixellayer.norm)
+      
+      # Area per pixel layer
+      pixellayer.area <- table(dist.factor)
+      pixellayer.area <- pixellayer.area[pixellayer.area > 0]
+      
+      list(pixellayer = pixellayer,
+           pixellayer.norm = pixellayer.norm,
+           pixellayer.area = pixellayer.area)
+      
+}
+
+TrimMean <- function(x, trim = 0.2) {
+  if (length(x) < 3) {
+    trim = 0
+  }
+  y <- x[x >= quantile(x, c(trim)) & x <= quantile(x, c(1 - trim))]
+  mean(y)
+}
+
+GetHalfwayPoint <- function(d, d.zero, x.max = 40) {
+  
+  # First, I want to find the lower bound to 0
+  # d.zero <- quantile(d, 0.2)
+  
+  # Then, I want to get rid of the peak itself
+  d.subset <- d[1 : (x.max + 5)]
+  
+  d.max <- which(d.subset > 0.95 * max(d.subset))
+  d.max <- as.vector(d.max[length(d.max)])
+  #d.subset <- d[(d.max + 1) : length(d)]
+  d.subset <- d.subset[(d.max + 1) : length(d.subset)]
+  
+  # Fit exponential decay function
+  z <- nls(y ~ SSasymp(x, yf, y0, log_alpha), 
+           data = data.frame(x = seq_along(d.subset), 
+                             y = as.vector(d.subset)))
+  
+  lines(seq_along(d.subset) + d.max, predict(z, seq_along(d.subset)), 
+        col = "black", lty = 2)
+  
+  # Then, what is the halfway value?
+  d50 <- mean(c(d.zero, max(d)))
+  
+  # Can we get this value?
+  d50.pix <- approx(x = predict(z), y = seq_along(d.subset) + d.max, xout = d50)$y
+  points(d50.pix, d50, col = "black", pch = 19, cex = 2)
+  
+  # Finally, correct the d50 value for d.zero
+  # d50 <- d50 + d.zero
+  
+  return(list(d50 = d50, d50.pix = d50.pix))
+  
+}
+
+RadialProfile <- function(data.per.pix, ref.per.pix, area.per.pix, exp.name,
+                          dapi.per.pix, lam.per.pix,
+                          xlim = c(0, 40), unit = "pixel") {
+  
+  # profile plot of a signal
+  ########################################################################
+  if(missing(data.per.pix))
+    stop('argument data.per.pix missing')
+  if(missing(area.per.pix))
+    stop('argument area.per.pix missing')
+
+  # Use shorter names
+  d <- data.per.pix
+  
+  if (missing(dapi.per.pix) == FALSE & missing(lam.per.pix) == FALSE) {
+    l <- lam.per.pix
+    da <- dapi.per.pix
+  }
+  
+  ### set up plot
+  xlab <- paste0("Distance from nuclear rim (", unit, ")")
+  ylab <- 'average signal'
+  ylim <- c(0, max(c(d)))
+  title <- sprintf('profile per %s; %s', unit, exp)
+  
+  plot(NA, xlim=xlim, ylim=ylim, xlab=xlab, ylab=ylab, 
+       ty='o', pch=19, lwd=2, main=title)
+  lines(d, col='red', ty='o', pch=19, lwd=2, cex=.5)
+  
+  if (missing(dapi.per.pix) == FALSE & missing(lam.per.pix) == FALSE) {
+    # lines(da, col='blue', ty='o', pch=19, lwd=2, cex=.5)
+    lines(l, col='green', ty='o', pch=19, lwd=2, cex=.5)
+  } 
+  
+  # At which pixel do we observe the half-max value, with what value?
+  d.zero <- quantile(d, 0.2)
+  halfway <- GetHalfwayPoint(d, d.zero = d.zero, x.max = 15)
+  d50 <- halfway[["d50"]]
+  d50.pix <- halfway[["d50.pix"]]
+  
+  # Repeat this exercise for the lamina
+  if (missing(lam.per.pix) == FALSE) {
+    l.zero <- quantile(l, 0.2)
+    l.halfway <- GetHalfwayPoint(l, d.zero = l.zero, x.max = 15)
+    l.d50 <- l.halfway[["d50"]]
+    l.d50.pix <- l.halfway[["d50.pix"]]
+  }
+  
+  # draw lines indicating the d50 values
+  lines(x=c(d50.pix, d50.pix), y=c(d50, -1), lty=2, lwd=2, col='grey')
+  lines(x=c(l.d50.pix, l.d50.pix), y=c(l.d50, -1), lty=2, lwd=2, col='grey')
+  
+  # make legend 
+  col <- c('red','grey')
+  lty <- 1:2
+  legend <- c('signal', sprintf('half-max (pixel=%.2f, p50=%.4f)', d50.pix, d50))
+  
+  if (missing(dapi.per.pix) == FALSE & missing(lam.per.pix) == FALSE) {
+    # col <- c('red', 'blue', 'green', 'grey', 'grey')
+    # lty <- c(1, 1, 1, 2, 2)
+    # legend <- c('tracer', 'dapi', 'lamina', 
+    #             sprintf('half-max tracer (pixel=%.2f, p50=%.4f)', d50.pix, d50),
+    #             sprintf('half-max lamina (pixel=%.2f, p50=%.4f)', l.d50.pix, l.d50))
+    col <- c('red', 'green', 'grey', 'grey')
+    lty <- c(1, 1, 2, 2)
+    legend <- c('tracer', 'lamina', 
+                sprintf('half-max tracer (pixel=%.2f, p50=%.4f)', d50.pix, d50),
+                sprintf('half-max lamina (pixel=%.2f, p50=%.4f)', l.d50.pix, l.d50))
+  } else {
+    col <- c('red','grey')
+    lty <- 1:2
+    legend <- c('signal', sprintf('half-max (pixel=%.2f, p50=%.4f)', d50.pix, d50))
+  }
+
+  legend(x='topr', inset=0.025, bty='n', col=col, lwd=2, lty=lty, legend=legend)
+  ret.list <- list(d50 = d50, d50.pix = d50.pix,
+                   l.d50 = l.d50, l.d50.pix = l.d50.pix)
+
+  
+  # save m.50 values to file
+  return(ret.list)
+}
+
+```
+
+
+### Radial profiles
+
+```{r radial profiles}
+
+image.paths <- as.character(c("ts190729_processed_images/ts190221_HTC75_DamID_m6Tracer_analysis/", 
+                              "ts190729_processed_images/mv190314_pADam_analysis/",
+                              "ts190729_processed_images/ts190411_HTC75_analysis/"))
+image.paths <- normalizePath(image.paths)
+
+################################################################################
+# MAIN #########################################################################
+################################################################################
+
+# loop over the three directories containing images
+exp.res <- list()
+
+for (image.path in image.paths) {
+  
+  # Get image path
+  image.path.short <- basename(image.path)
+  
+  cat('Processing images in', image.path, '\n')
+  
+  # init results list
+  exp.res[[image.path]] <- list()
+  
+  # List experiments
+  experiments <- dir(path=image.path, pattern='segmentation')
+  experiments.names <- gsub("_segmentation.pgm", "", experiments)
+  
+  experiments.df <- data.frame(files = experiments,
+                               names = experiments.names,
+                               stringsAsFactors = FALSE)
+  
+  experiments.df$target <- sapply(experiments.df$names, 
+                                  function(x) strsplit(x, "_")[[1]][2])
+  experiments.df$plate <- sapply(experiments.df$names, 
+                                 function(x) strsplit(x, "_")[[1]][3])
+  experiments.df$cell <- sapply(experiments.df$names, 
+                                function(x) strsplit(x, "_")[[1]][1])
+  
+  experiments.df$sample <- gsub("_\\d+_\\d+", "", experiments.df$names)
+  
+  exp.res[[image.path]][["experiments.df"]] <- experiments.df
+  
+  
+  # Loop over experiments
+  for (i in 1:nrow(experiments.df)) {
+    
+    exp <- experiments.df$names[i]
+    
+    # Read images
+    mask <- ReadPGNFromDF(experiments.df, i, "segmentation")
+    dist <- ReadPGNFromDF(experiments.df, i, "distancemap")
+    dapi <- ReadPGNFromDF(experiments.df, i, "DAPI")
+    lamina <- ReadPGNFromDF(experiments.df, i, "lamina")
+    tracer <- ReadPGNFromDF(experiments.df, i, "tracer")
+    
+    # check that distance map is using correct pixel values
+    # If not, invert the values
+    #######################################################
+    # (distance at nuclear lamina = 1)
+    tbl <- table(dist)
+    if (lm(as.integer(names(tbl))~tbl)[['coefficients']][[2]] > 0) {
+      # positive slope; increasing number of pixels with increasing distance values: WRONG!!
+      dist <- abs(dist - 255)
+    }
+
+    # collect data per pixel layer
+    ##############################
+    dist.factor <- factor(dist, levels=1:255)
+    
+    # MEAN meth signal per signal (area = 1 and therefore not used)
+    dapi.layer <- GetSignalPerLayer(dapi, dist.factor, f = TrimMean, q = 0.2)
+    lamina.layer <- GetSignalPerLayer(lamina, dist.factor, f = TrimMean, q = 0.2)
+    tracer.layer <- GetSignalPerLayer(tracer, dist.factor, f = TrimMean, q = 0.2)
+    
+    # Decide whether the cell passes the quality checks - using the unscaled 
+    # data
+    t <- tracer.layer[["pixellayer"]]
+    
+    if (abs(log2(max(t) / quantile(t, 0.2))) < 2) {
+      cat(paste0("Skipping sample ", exp, "; no lamina enrichment\n"))
+      next
+    }
+    if (length(t) < 10) {
+      cat(paste0("Skipping sample ", exp, "; thickness < 10\n"))
+      next
+    }
+    
+    # If all is good, process the image
+    cat('Processing image:', exp, '\n')
+
+    # images 
+    ########
+    # create radial profile plot, and get the d50 distances
+    pdf(file.path(image_dir, paste0(image.path.short, "_", exp, "_profile.pdf")),
+        width = 7, height = 6)
+    
+    tryCatch(
+    {
+      halfway.scores <- RadialProfile(data.per.pix = tracer.layer[['pixellayer.norm']],
+                                      area.per.pix = tracer.layer[['pixellayer.area']],
+                                      dapi.per.pix = dapi.layer[['pixellayer.norm']],
+                                      lam.per.pix  = lamina.layer[['pixellayer.norm']],
+                                      exp.name     = exp)
+      
+      if (! is.na(halfway.scores)[1]) {
+        m.50.pix <- halfway.scores[["d50"]]
+      } else {
+        m.50.pix <- halfway.scores
+      }
+    },
+    error = function(cond) {
+      cat("   singular gradient:", exp, "\n")
+      halfway.scores <- m.50.pix <- NA
+    })
+    
+    if (any(is.na(halfway.scores))) {
+      next
+    }
+    
+    dev.off()
+    
+    
+    # Next, create a image compilation
+    png(file.path(image_dir, paste0(image.path.short, "_", exp, "_signal.png")),
+        res = 144, width = 900, height = 600)
+    opar <- par(mfrow=c(2,3), mar=c(1,1,1,1))
+    
+    # 1) DAPI
+    image(dapi, col=gray(seq(1,0, length.out=256)),axes=FALSE,main="DAPI")
+    box()
+    
+    # 2) Lamina
+    image(lamina, col=gray(seq(1,0, length.out=256)), axes=FALSE,main="Lamina")
+    box()
+    
+    # 3) Tracer
+    image(tracer, col=gray(seq(1,0, length.out=256)), axes=FALSE,main="Tracer")
+    box()
+    
+    # 4) Mask
+    image(mask, col=gray(seq(0,1, length.out=256)), axes=FALSE,main="Mask")
+    box()
+    
+    # 5) Distance map
+    image(dist, col=gray(seq(1,0, length.out=256)), axes=FALSE,main="DistanceMap")
+    box()
+    
+    # 6) Halfway distance ( + mask ) 
+    image(dist==m.50.pix | dist==1, col=c(0,2),main="m50.pix + dist==1")
+    box()
+    
+    par(opar)
+    dev.off()
+    
+    # Finally, save the values
+    exp.res[[image.path]][[exp]] <- list()
+    
+    exp.res[[image.path]][[exp]][["DAPI"]] <- dapi.layer
+    exp.res[[image.path]][[exp]][["lamina"]] <- lamina.layer
+    exp.res[[image.path]][[exp]][["tracer"]] <- tracer.layer
+    
+    exp.res[[image.path]][[exp]][["halfway.scores"]] <- halfway.scores
+    
+  }
+}
+
+```
+
+
+### Combine results per experiment
+
+The previous section simply reads all the files and processes them in the same
+way. This means that individual experiments are not treated differently. Here,
+I will generate plots for this experiment specifically. 
+
+```{r combine results per experiment, fig.width = 6, fig.height = 5}
+
+# Prepare output
+classes.list <- list()
+
+for (image.path in image.paths) {
+  
+  # Get combined experiment.df
+  experiments.df <- exp.res[[image.path]][["experiments.df"]]
+  
+  # Get classes
+  filter <- c("Damonly", "neg", "tryp", "withoutshield", "shield_pos")
+  
+  # classes <- unique(paste(experiments.df$cell,
+  #                         experiments.df$plate,
+  #                         experiments.df$target,
+  #                         sep = "_"))
+  classes <- unique(experiments.df$sample)
+  classes <- grep(paste(filter, collapse = "|"), classes, invert = T, value = T)
+  
+  # Define range of interest
+  xlim <- c(0, 30)
+  df.template <- data.frame(distance = 1:xlim[2])
+  
+  for (class in classes) {
+    
+    # Get the samples for every experiment
+    samples <- grep(class, experiments.df$names, value = T)
+    samples.filter <- c()
+    
+    # Get signal for every pixel
+    df <- data.frame(distance = c(1:xlim[2]))
+    
+    for (exp in samples) {
+      
+      if (is.null(exp.res[[image.path]][[exp]])) {
+        next
+      }
+      samples.filter <- c(samples.filter, exp)
+      
+      m <- exp.res[[image.path]][[exp]][["tracer"]][["pixellayer.norm"]]
+      d <- exp.res[[image.path]][[exp]][["DAPI"]][["pixellayer.norm"]]
+      l <- exp.res[[image.path]][[exp]][["lamina"]][["pixellayer.norm"]]
+      
+      df.tmp <- data.frame(distance = names(m), m = m, l = l, d = d)
+      df <- merge(df, df.tmp, by = "distance", all = T)
+      
+      names(df)[(ncol(df) - 2) : ncol(df)] <- paste0(exp, "_",
+                                                     c("tracer", "lam", "dapi"))
+    
+    }
+    
+    df$distance <- as.numeric(df$distance)
+    df <- df[order(df$distance), ]
+    
+    # Calculate mean signal for every pixel
+    df$tracer <- rowMeans(df[, paste0(samples.filter, "_tracer")])
+    df$lam <- rowMeans(df[, paste0(samples.filter, "_lam")])
+    df$dapi <- rowMeans(df[, paste0(samples.filter, "_dapi")])
+    
+  
+    # Plotting
+    xlab <- 'pixels away from nuclear rim'
+    ylab <- 'average signal per pixel'
+    
+    plot(NA, xlim=xlim, ylim=c(0, 1), xlab=xlab, ylab=ylab, ty='o', pch=19, lwd=2,
+         main = class)
+    lines(df$tracer, col='red', ty='o', pch=19, lwd=2, cex=.5)
+    # lines(dapi, col='blue', ty='o', pch=19, lwd=2, cex=.5)
+    lines(df$lam, col='green', ty='o', pch=19, lwd=2, cex=.5)
+    # lines(x=c(-10, m.50.pix, m.50.pix), y=c(m.50, m.50, -1), lty=2, lwd=2, col='grey')
+    # legend(x='topr', inset=0.025, bty='n', col=c('red', 'green', 'grey'), lwd=2, lty=c(1,1,2),
+    #        legend=c('methyl-tracer', 'lamina', sprintf('half-max (pixel=%i, p50=%.4f)', m.50.pix, m.50)))
+    legend(x='topr', inset=0.025, bty='n', col=c('red', 'green', 'grey'), lwd=2, lty=c(1,1,2),
+         legend=c('methyl-tracer', 'lamina'))
+    
+    classes.list[[class]][["df"]] <- df
+  
+  }
+}
+
+
+
+
+
+# Combine lines in a single plot
+classes <- names(classes.list)
+
+# 1) Antibody
+plot(NA, xlim=xlim, ylim=c(0, 1), xlab=xlab, ylab=ylab, ty='o', pch=19, lwd=2,
+     main = "Lamina distributions")
+
+for (i in seq_along(classes)) {
+
+  class <- classes[i]
+  lines(classes.list[[class]][["df"]][, "lam"], col=i, ty='o', pch=19, lwd=2, cex=.5)
+}
+
+legend(x='topright', inset=0.025, bty='n', col = 1:length(classes), lwd=2,
+       legend=classes)
+
+
+# 2) Tracer
+plot(NA, xlim=xlim, ylim=c(0, 1), xlab=xlab, ylab=ylab, ty='o', pch=19, lwd=2,
+     main = "Tracer distributions")
+
+for (i in seq_along(classes)) {
+
+  class <- classes[i]
+  lines(classes.list[[class]][["df"]][, "tracer"], col=i, ty='o', pch=19, lwd=2, cex=.5)
+}
+
+legend(x='topright', inset=0.025, bty='n', col = 1:length(classes), lwd=2,
+       legend=classes)
+
+
+# 3) DAPI
+plot(NA, xlim=xlim, ylim=c(0, 1), xlab=xlab, ylab=ylab, ty='o', pch=19, lwd=2,
+     main = "DAPI distributions")
+
+for (i in seq_along(classes)) {
+
+  class <- classes[i]
+  lines(classes.list[[class]][["df"]][, "dapi"], col=i, ty='o', pch=19, lwd=2, cex=.5)
+}
+
+legend(x='topright', inset=0.025, bty='n', col = 1:length(classes), lwd=2,
+       legend=classes)
+
+
+# Finally, combined antibody + tracer in one figure
+# Combine lines in a single plot
+plot(NA, xlim=xlim, ylim=c(0, 1), xlab=xlab, ylab=ylab, ty='o', pch=19, lwd=2,
+     main = "Lamina & tracer distributions")
+
+for (i in seq_along(classes)) {
+
+  class <- classes[i]
+  lines(classes.list[[class]][["df"]][, "lam"], col=i, ty='o', pch=19, lwd=2, cex=.5, lty = 2)
+  lines(classes.list[[class]][["df"]][, "tracer"], col=i, ty='o', pch=19, lwd=2, cex=.5)
+}
+
+legend(x='topright', inset=0.025, bty='n', col = 1:length(classes), lwd=2,
+       legend=classes)
+legend(x='bottomleft', inset=0.025, bty='n', col = 1, lwd=2, lty = c(2, 1),
+       legend=c("lamina", "tracer"))
+
+```
+
+
+### Per-cell difference in m50 point
+
+Alternatively, I can look at the difference in m50 point for the lamina and 
+tracer, for every cell. And put these into a scatterplot.
+
+```{r m50 differences, fig.width = 4.5, fig.height = 5.5}
+
+d50 <- c()
+classes.selection <- classes
+
+for (class in classes.selection) {
+  
+  # Combine experiments.df
+  for (image.path in image.paths) {
+    
+    # Get combined experiment.df
+    experiments.df <- exp.res[[image.path]][["experiments.df"]]
+    
+    # Get the samples for every experiment
+    samples <- grep(class, experiments.df$names, value = T)
+    
+    # Get a vector of halfway points
+    for (exp in samples) {
+      
+      if (is.null(exp.res[[image.path]][[exp]])) {
+        next
+      }
+      
+      d50.sample <- exp.res[[image.path]][[exp]][["halfway.scores"]][["d50.pix"]]
+      l50.sample <- exp.res[[image.path]][[exp]][["halfway.scores"]][["l.d50.pix"]]
+      
+      d50 <- rbind(d50, 
+                   data.frame(class = class, exp = exp, 
+                              d50 = d50.sample, l50 = l50.sample,
+                              diff = d50.sample - l50.sample,
+                              image.path = basename(image.path)))
+      
+    }
+  }
+}
+
+# Manually: filter classes further
+d50$class[d50$class == "HT1080_LMNB2"] <- "HT1080_pADamID_LMNB2"
+d50 <- d50[d50$class != "RPE_LMNB2", ]
+
+plt <- ggplot(d50, aes(x = class, y = diff)) +
+  geom_boxplot(outlier.shape = NA, fill = NA, width = 0.2) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Difference (pixel)") +
+  ggtitle("Difference halfway decay tracer vs lamina") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+plt <- ggplot(d50, aes(x = class, y = diff, col = image.path)) +
+  geom_boxplot(outlier.shape = NA, fill = NA, width = 0.2) +
+  geom_quasirandom() +
+  xlab("") +
+  ylab("Difference (pixel)") +
+  ggtitle("Difference halfway decay tracer vs lamina") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+plot(plt)
+
+```
+
+
+### Conclusion
+
+First of all, this needs a bit more work and a few more cells to be really 
+reliable. Still, we can have some observations:
+
+  * The trypsin sample (very ugly cells) and the -shield sample (very little
+    signal) are probably useless and can be disregarded for now.
+  * There is almost no difference between the flat cells and the nuclear 
+    isolated cells with regard to their lamina and tracer "thickness". 
+  * For the pA-DamID sample, we can see that the lamina and the tracer are 
+    even less thick. Especially for the lamina, I don't know why. Most likely,
+    we have very few cells and were a little bit more stringent in selecting 
+    useful cells. Also, the cells have less of these invaginations and lamina
+    bridges. Coindicide or pA-DamID?
+  * Regardless of the thinner lamina, we can definitely say that the tracer is 
+    not thicker. If anything, it is even thinner than the shield induced sample.
+    (Which actually makes sense, right? There are no active movements in pA-
+    DamID.)
+    
+I think we should repeat this exercise, preferably a bit cleaner, and leave it
+at this.
+
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+

@@ -1,0 +1,317 @@
+---
+title: "pA-DamID peripheral tracer enrichment"
+author: "Tom van Schaik"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    theme: journal #cerulean
+    highlight: monochrome
+    toc: true
+    toc_float: true
+    code_folding: show
+  editor_options:
+    chunk_output_type: console
+---
+
+pA-DamID peripheral tracer enrichment.
+
+Given 4 .csv files for every slide:
+
+  * periphery, tracer
+  * interior, tracer
+  * periphery, antibody
+  * interior, antibody
+  
+determine the peripheral enrichment. Note that these files contain
+coordinates that should be matched - the order can differ between them!
+
+### Setup
+
+Load the required libraries.
+
+```{r setup}
+
+# Load libraries
+library(ggplot2)
+library(reshape2)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(tidyverse)
+
+# Output file
+output_file <- "ts200526_all_enrichments.txt"
+output_dir <- "ts200526_pADamID_peripheral_tracer_enrichment_combined"
+dir.create(output_dir, showWarnings = FALSE)
+
+```
+
+```{r knits setup}
+library(knitr)
+opts_chunk$set(dev=c('png', 'pdf'), fig.path = file.path(output_dir, "figures/"))
+pdf.options(useDingbats = FALSE)
+```
+
+
+### Define functions
+
+Functions required for this document.
+
+```{r define functions}
+
+ListSlides <- function(directory) {
+  # Given an input directory, list all the slide names in here.
+  files <- list.files(directory)
+  files <- grep("periphery,tracer", files, value = T)
+  
+  slides <- gsub(",periphery,tracer.csv", "", files)
+  slides
+}
+
+GetExperiment <- function(slides) {
+  # Given a vector of slide names, return a factor of experiment names
+  experiments <- factor(gsub("_[0-9]+$", "", slides))
+  experiments
+}
+
+ReadSlide <- function(slide_name, experiment, max_distance = 10) {
+  # Given a slide name, return a data frame with mean intensities. Combine the 
+  # various .csv files using their coordinates.
+  
+  # Note: with the HALO Tracer, these are in a different order
+  periphery_tracer <- read.csv(paste0(slide_name, ",periphery,tracer.csv"))
+  interior_tracer <- read.csv(paste0(slide_name, ",interior,tracer.csv"))
+  periphery_antibody <- read.csv(paste0(slide_name, ",periphery,antibody.csv"))
+  interior_antibody <- read.csv(paste0(slide_name, ",interior,antibody.csv"))
+  # periphery_tracer <- read.csv(paste0(slide_name, ",periphery,antibody.csv"))
+  # interior_tracer <- read.csv(paste0(slide_name, ",interior,antibody.csv"))
+  # periphery_antibody <- read.csv(paste0(slide_name, ",periphery,tracer.csv"))
+  # interior_antibody <- read.csv(paste0(slide_name, ",interior,tracer.csv"))
+  
+  # For every cell, find the matching cells in the other data frames
+  slide <- c()
+  for (i in 1:nrow(periphery_tracer)) {
+    periphery_tracer_row <- periphery_tracer[i, ]
+    
+    periphery_tracer_value <- periphery_tracer_row["Mean"]
+    interior_tracer_value <- interior_tracer[which(abs(interior_tracer$X - periphery_tracer_row$X) < max_distance &
+                                                   abs(interior_tracer$Y - periphery_tracer_row$Y) < max_distance),
+                                             "Mean"]
+    periphery_antibody_value <- periphery_antibody[which(abs(periphery_antibody$X - periphery_tracer_row$X) < max_distance &
+                                                         abs(periphery_antibody$Y - periphery_tracer_row$Y) < max_distance),
+                                                   "Mean"]
+    interior_antibody_value <- interior_antibody[which(abs(interior_antibody$X - periphery_tracer_row$X) < max_distance &
+                                                       abs(interior_antibody$Y - periphery_tracer_row$Y) < max_distance),
+                                                 "Mean"]
+    surface <- periphery_tracer_row[, 2] + 
+      interior_tracer[which(abs(interior_tracer$X - periphery_tracer_row$X) < max_distance &
+                              abs(interior_tracer$Y - periphery_tracer_row$Y) < max_distance),
+                      2]
+    
+    if (length(periphery_tracer_value) == 1 &
+          length(interior_tracer_value) == 1 &
+          length(periphery_antibody_value) == 1 &
+          length(interior_antibody_value) == 1 &
+          length(surface) == 1) {
+     
+      slide <- rbind(slide,
+                     data.frame(periphery_tracer_value,
+                                interior_tracer_value,
+                                periphery_antibody_value,
+                                interior_antibody_value,
+                                surface = surface,
+                                experiment,
+                                stringsAsFactors = FALSE)) 
+      
+    }
+
+  }
+  
+  # Make sure the names are correct
+  names(slide) <- c("periphery_tracer",
+                    "interior_tracer",
+                    "periphery_antibody",
+                    "interior_antibody",
+                    "surface",
+                    "experiment")
+  
+  slide
+}
+
+CalculateLog2Ratios <- function(data) {
+  # Calculate the enrichment ratios (periphery over interior) for all the rows
+  data$tracer <- log2(data$periphery_tracer / data$interior_tracer)
+  data$antibody <- log2(data$periphery_antibody / data$interior_antibody)
+
+  data
+}
+
+PlotEnrichment <- function(data) {
+  # Plot the enrichment ratios for every experiment group
+  data <- data[, c("experiment", "tracer", "antibody")]
+  
+  data <- melt(data, id.vars = "experiment")
+  
+  plt <- ggplot(data, aes(x = experiment, col = variable, y = value,
+                          group = interaction(experiment, variable))) +
+    geom_hline(yintercept = 0, col = "black", linetype = "dashed") +
+    geom_quasirandom(dodge.width = 0.75, size = 1) +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+    ggtitle("peripheral-interior enrichment") +
+    xlab("") +
+    ylab("enrichment (log2)") +
+    scale_colour_brewer(palette = "Set1") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+  plt
+}
+
+PlotRawScores <- function(data, channel = "tracer") {
+  # Plot the enrichment ratios for every experiment group
+  if (channel == "tracer") {
+    data <- data[, c("experiment", 
+                   "periphery_tracer", "interior_tracer")]
+  } else if (channel == "antibody") {
+    data <- data[, c("experiment", 
+                   "periphery_antibody", "interior_antibody")]
+  } else {
+    data <- data[, c("experiment", 
+                   "periphery_tracer", "interior_tracer",
+                   "periphery_antibody", "interior_antibody")]
+  }
+  
+  
+  data <- melt(data, id.vars = "experiment")
+  
+  plt <- ggplot(data, aes(x = experiment, col = variable, y = value,
+                          group = interaction(experiment, variable))) +
+    geom_quasirandom(dodge.width = 0.75, size = 1) +
+    geom_boxplot(outlier.shape = NA, fill = NA, col = "black") +
+    ggtitle("raw scores") +
+    xlab("") +
+    ylab("mean intensity") +
+    scale_colour_brewer(palette = "Set1",
+                        labels = c("periphery", "interior")) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+  plt
+}
+
+```
+
+### Load data
+
+Read in the data, given a list of directories with "analysis" results from the 
+imageJ script that creates 4 .csv files for every slide.
+
+```{r load data}
+
+# Input directory for the files
+directories <- c("./data/pADamID_Hap1_plus6_mouseAntibodies_analysis/",
+                 
+                 "./data/pADamID_MethylTracer_analysis/",
+                 
+                 "./data/ts181030_pADamID_M6Tracer_analysis/",
+                 
+                 "./data/ts181030_pADamID_stability_analysis/")
+
+
+
+data <- c()
+
+for (directory in directories) {
+  # Get the slide names
+  slides <- ListSlides(directory)
+
+  # Extract experiment names
+  experiments <- GetExperiment(slides)
+  
+  # Read in all the .csv files and form one data frame
+  for (i in 1:length(slides)) {
+    data <- rbind(data,
+                  ReadSlide(slide_name = file.path(directory, slides[i]),
+                            experiment = experiments[i]))
+  }
+}
+
+```
+
+### Calculate enrichment
+
+Calculate the enrichment ratios for every cell.
+
+```{r calculate enrichment}
+
+# Calculate enrichment
+data <- CalculateLog2Ratios(data)
+
+```
+
+### Plot enrichment
+
+Finally, create a plot with enrichment scores. Also, write the mean scores for 
+each experiment to a file.
+
+```{r plot enrichment, fig.width = 10, fig.height = 5}
+
+plt <- PlotEnrichment(data)
+plot(plt)
+
+plt <- PlotRawScores(data)
+plot(plt)
+
+```
+
+```{r plot selected enrichments, fig.width = 4.5, fig.height = 3.5}
+
+# Also, create a plot with selected features
+data.filtered <- as_tibble(data) %>%
+  mutate(experiment = as.character(experiment)) %>%
+  mutate(experiment = case_when(experiment == "sample_2" ~ "Dam",
+                                experiment == "sample_5-2" ~ "Lamin B1",
+                                experiment == "sample_12" ~ "H3K27me3",
+                                experiment == "sample_14" ~ "H3K9me3",
+                                experiment == "LMNB1_rabbit" ~ "Lamin B1",
+                                experiment == "LMNB2" ~ "Lamin B2",
+                                experiment == "pA-Dam" ~ "pADam",
+                                experiment == "L1-100" ~ "Lamin B1",
+                                experiment == "L1-500" ~ "Lamin B1",
+                                experiment == "L2-100" ~ "Lamin B2",
+                                experiment == "L2-500" ~ "Lamin B2",
+                                T ~ experiment)) %>%
+  filter(experiment %in% c("Dam", "pADam", "Lamin B1", "Lamin B2", "H3K27me3",
+                           "H3K9me3")) %>%
+  mutate(experiment = factor(experiment, levels = c("Dam", "pADam", "Lamin B1", 
+                                                    "Lamin B2", "H3K27me3", 
+                                                    "H3K9me3"))) %>%
+  as.data.frame()
+
+plt <- PlotEnrichment(data.filtered)
+plot(plt)
+
+plt <- PlotRawScores(data.filtered)
+plot(plt)
+
+```
+
+```{r write median}
+
+# Calculate median
+median.df <- as.data.frame(tapply(data$tracer, data$experiment, median))
+names(median.df) <- "enrichment"
+median.df$samples <- rownames(median.df)
+write.table(median.df, output_file,
+            row.names = F, col.names = T, sep = "\t", quote = F)
+
+```
+
+### SessionInfo
+
+```{r sessionInfo}
+
+sessionInfo()
+
+```
+
+
